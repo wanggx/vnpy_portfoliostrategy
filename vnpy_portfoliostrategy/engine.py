@@ -404,7 +404,11 @@ class StrategyEngine(BaseEngine):
             contract: ContractData | None = self.main_engine.get_contract(vt_symbol)
             if contract:
                 req: SubscribeRequest = SubscribeRequest(
-                    symbol=contract.symbol, exchange=contract.exchange)
+                    symbol=contract.symbol,
+                    exchange=contract.exchange,
+                    app_name=APP_NAME,
+                    subscriber_name=strategy.strategy_name
+                )
                 self.main_engine.subscribe(req, contract.gateway_name)
             else:
                 self.write_log(_("行情订阅失败，找不到合约{}").format(vt_symbol), strategy)
@@ -469,6 +473,16 @@ class StrategyEngine(BaseEngine):
             return False
 
         for vt_symbol in strategy.vt_symbols:
+            contract: ContractData | None = self.main_engine.get_contract(vt_symbol)
+            if contract:
+                req: SubscribeRequest = SubscribeRequest(
+                    symbol=contract.symbol,
+                    exchange=contract.exchange,
+                    app_name=APP_NAME,
+                    subscriber_name=strategy.strategy_name
+                )
+                self.main_engine.unsubscribe(req, contract.gateway_name)
+
             strategies: list = self.symbol_strategy_map[vt_symbol]
             strategies.remove(strategy)
 
