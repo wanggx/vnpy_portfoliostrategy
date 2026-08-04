@@ -226,6 +226,74 @@ class StrategyEngine(BaseEngine):
         for vt_orderid in list(strategy.active_orderids):
             self.cancel_order(strategy, vt_orderid)
 
+    def subscribe_symbols(
+        self, strategy: StrategyTemplate, vt_symbols: list[str]
+    ) -> None:
+        """运行期为策略动态订阅行情
+
+        与 ``_init_strategy`` 中的订阅逻辑一致：取合约、构造带订阅者标识的
+        ``SubscribeRequest`` 调 ``MainEngine.subscribe``，并同步更新
+        ``strategy.vt_symbols`` 与 ``symbol_strategy_map``（行情路由依赖它，
+        见 ``process_tick_event``）。已订阅的标的会跳过，避免重复订阅。
+        找不到合约时写日志不抛异常，保证批量订阅不被单只异常中断。
+        """
+        for vt_symbol in vt_symbols:
+            if not vt_symbol:
+                continue
+
+            # 已在该标的的策略列表中则跳过，避免重复订阅
+            strategies: list = self.symbol_strategy_map[vt_symbol]
+            if strategy in strategies:
+                continue
+
+            contract: ContractData | None = self.main_engine.get_contract(vt_symbol)
+            if not contract:
+                self.write_log(_("行情订阅失败，找不到合约{}").format(vt_symbol), strategy)
+                continue
+
+            req: SubscribeRequest = SubscribeRequest(
+                symbol=contract.symbol,
+                exchange=contract.exchange,
+                app_name=APP_NAME,
+                subscriber_name=strategy.strategy_name,
+            )
+            self.main_engine.subscribe(req, contract.gateway_name)
+
+            strategies.append(strategy)
+            if vt_symbol not in strategy.vt_symbols:
+                strategy.vt_symbols.append(vt_symbol)
+
+    def unsubscribe_symbols(
+        self, strategy: StrategyTemplate, vt_symbols: list[str]
+    ) -> None:
+        """运行期为策略动态退订行情
+
+        与 ``remove_strategy`` 中的退订逻辑一致：构造带订阅者标识的
+        ``SubscribeRequest`` 调 ``MainEngine.unsubscribe``（按订阅者退订，
+        不影响其他策略对该标的的订阅），并从 ``symbol_strategy_map`` 与
+        ``strategy.vt_symbols`` 移除该项。合约不存在时仅清理本地登记。
+        """
+        for vt_symbol in vt_symbols:
+            if not vt_symbol:
+                continue
+
+            contract: ContractData | None = self.main_engine.get_contract(vt_symbol)
+            if contract:
+                req: SubscribeRequest = SubscribeRequest(
+                    symbol=contract.symbol,
+                    exchange=contract.exchange,
+                    app_name=APP_NAME,
+                    subscriber_name=strategy.strategy_name,
+                )
+                self.main_engine.unsubscribe(req, contract.gateway_name)
+
+            strategies: list = self.symbol_strategy_map.get(vt_symbol, [])
+            if strategy in strategies:
+                strategies.remove(strategy)
+
+            if vt_symbol in strategy.vt_symbols:
+                strategy.vt_symbols.remove(vt_symbol)
+
     def get_engine_type(self) -> EngineType:
         """获取引擎类型"""
         return self.engine_type
