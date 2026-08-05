@@ -20,19 +20,22 @@ from vnpy.trader.object import (
     OrderData,
     TradeData,
     BarData,
-    ContractData
+    ContractData,
+    PositionData
 )
 from vnpy.trader.event import (
     EVENT_TICK,
     EVENT_ORDER,
-    EVENT_TRADE
+    EVENT_TRADE,
+    EVENT_POSITION
 )
 from vnpy.trader.constant import (
     Direction,
     OrderType,
     Interval,
     Exchange,
-    Offset
+    Offset,
+    Status
 )
 from vnpy.trader.utility import load_json, save_json, extract_vt_symbol, round_to
 from vnpy.trader.datafeed import BaseDatafeed, get_datafeed
@@ -72,6 +75,10 @@ class StrategyEngine(BaseEngine):
 
         self.vt_tradeids: set[str] = set()
 
+        # T+1 卖出冻结量（参考 vnpy_ctastrategy）：vt_orderid -> volume，
+        # 在发起卖出委托时冻结、撤单/成交回报时释放。
+        self.sell_frozen_by_orderid: dict[str, tuple[str, float]] = {}
+
         # 数据库和数据服务
         self.database: BaseDatabase = get_database()
         self.datafeed: BaseDatafeed = get_datafeed()
@@ -94,6 +101,7 @@ class StrategyEngine(BaseEngine):
         self.event_engine.register(EVENT_TICK, self.process_tick_event)
         self.event_engine.register(EVENT_ORDER, self.process_order_event)
         self.event_engine.register(EVENT_TRADE, self.process_trade_event)
+        self.event_engine.register(EVENT_POSITION, self.process_position_event)
 
         log_engine: LogEngine = self.main_engine.get_engine("log")
         log_engine.register_log(EVENT_PORTFOLIO_LOG)
@@ -138,6 +146,12 @@ class StrategyEngine(BaseEngine):
         if not strategy:
             return
 
+        # 撤单/拒单：释放该委托冻结的可卖量
+        if strategy.t1 and order.status in {Status.CANCELLED, Status.REJECTED}:
+            frozen = self.sell_frozen_by_orderid.get(order.vt_orderid)
+            if frozen:
+                self.release_t1_sell_frozen(strategy, order.vt_orderid, frozen[1])
+
         self.call_strategy_func(strategy, strategy.update_order, order)
 
     def process_trade_event(self, event: Event) -> None:
@@ -154,7 +168,28 @@ class StrategyEngine(BaseEngine):
         if not strategy:
             return
 
+        # T+1 卖出成交：释放对应冻结量（先于 update_trade，使可卖量一致）
+        if strategy.t1 and trade.direction == Direction.SHORT:
+            self.release_t1_sell_frozen(strategy, trade.vt_orderid, trade.volume)
+
         self.call_strategy_func(strategy, strategy.update_trade, trade)
+
+    def process_position_event(self, event: Event) -> None:
+        """持仓数据推送：同步 T+1 策略的昨/今仓"""
+        position: PositionData = event.data
+
+        # 仅多头/净持仓有意义（A 股现货为 NET）
+        if position.direction not in {Direction.LONG, Direction.NET}:
+            return
+
+        strategies: list = self.symbol_strategy_map.get(position.vt_symbol, [])
+        for strategy in strategies:
+            if not strategy.t1:
+                continue
+            strategy.sync_t1_position(
+                position.vt_symbol, position.volume, position.yd_volume
+            )
+            self.put_strategy_event(strategy)
 
     def send_order(
         self,
@@ -175,6 +210,10 @@ class StrategyEngine(BaseEngine):
 
         price = round_to(price, contract.pricetick)
         volume = round_to(volume, contract.min_volume)
+
+        # T+1 下单校验：禁止开空/买平、校验可卖量、校验整手
+        if not self.check_t1_order(strategy, vt_symbol, direction, offset, volume):
+            return []
 
         original_req: OrderRequest = OrderRequest(
             symbol=contract.symbol,
@@ -209,6 +248,10 @@ class StrategyEngine(BaseEngine):
 
             self.orderid_strategy_map[vt_orderid] = strategy
 
+            # T+1 卖出委托：冻结可卖量
+            if self.is_t1_sell_order(strategy, direction, offset):
+                self.freeze_t1_sell(strategy, vt_symbol, vt_orderid, req.volume)
+
         return vt_orderids
 
     def cancel_order(self, strategy: StrategyTemplate, vt_orderid: str) -> None:
@@ -225,6 +268,136 @@ class StrategyEngine(BaseEngine):
         """委托撤单"""
         for vt_orderid in list(strategy.active_orderids):
             self.cancel_order(strategy, vt_orderid)
+
+    def is_t1_sell_order(
+        self, strategy: StrategyTemplate, direction: Direction, offset: Offset
+    ) -> bool:
+        """是否为 T+1 模式下的卖出平仓委托"""
+        return strategy.t1 and direction == Direction.SHORT and offset == Offset.CLOSE
+
+    def check_t1_order(
+        self,
+        strategy: StrategyTemplate,
+        vt_symbol: str,
+        direction: Direction,
+        offset: Offset,
+        volume: float
+    ) -> bool:
+        """T+1 下单前校验（参考 vnpy_ctastrategy）
+
+        - 禁止开空（SHORT + OPEN）与买平（LONG + CLOSE）；
+        - 卖出平仓需已同步持仓，且数量不超过可卖量（昨仓减冻结）；
+        - 买入数量须为 100 的整数倍（A 股最小买入手数）。
+        """
+        if not strategy.t1:
+            return True
+
+        if direction == Direction.SHORT and offset != Offset.CLOSE:
+            self.write_log("T+1 模式禁止开空仓", strategy)
+            return False
+
+        if direction == Direction.LONG and offset == Offset.CLOSE:
+            self.write_log("T+1 模式禁止买平", strategy)
+            return False
+
+        if direction == Direction.LONG and offset == Offset.OPEN and volume % 100:
+            self.write_log(
+                f"T+1 模式要求买入数量为 100 的整数倍：{volume}", strategy
+            )
+            return False
+
+        if self.is_t1_sell_order(strategy, direction, offset):
+            if not strategy.is_position_synced(vt_symbol):
+                self.write_log(
+                    f"T+1 模式持仓未同步，禁止卖出（vt_symbol={vt_symbol}）",
+                    strategy
+                )
+                return False
+
+            available: int = strategy.get_sellable(vt_symbol)
+            if volume > available:
+                self.write_log(
+                    f"T+1 可卖量不足：委托 {volume} 可卖 {available}（vt_symbol={vt_symbol}）",
+                    strategy
+                )
+                return False
+
+        return True
+
+    def freeze_t1_sell(
+        self,
+        strategy: StrategyTemplate,
+        vt_symbol: str,
+        vt_orderid: str,
+        volume: float,
+    ) -> None:
+        """冻结 T+1 卖出可卖量"""
+        if not strategy.t1 or not volume:
+            return
+
+        strategy.sell_frozen_data[vt_symbol] += volume
+        frozen = self.sell_frozen_by_orderid.get(vt_orderid)
+        frozen_volume: float = frozen[1] if frozen else 0
+        self.sell_frozen_by_orderid[vt_orderid] = (
+            vt_symbol, frozen_volume + volume
+        )
+
+    def release_t1_sell_frozen(
+        self, strategy: StrategyTemplate, vt_orderid: str, volume: float
+    ) -> None:
+        """释放 T+1 卖出冻结量（撤单/拒单/成交回报时）"""
+        if not strategy.t1 or volume <= 0:
+            return
+
+        frozen = self.sell_frozen_by_orderid.get(vt_orderid)
+        if not frozen:
+            return
+
+        vt_symbol, frozen_volume = frozen
+        release_volume: float = min(volume, frozen_volume)
+        if release_volume <= 0:
+            return
+
+        strategy.sell_frozen_data[vt_symbol] = max(
+            strategy.sell_frozen_data.get(vt_symbol, 0) - release_volume, 0
+        )
+
+        frozen_volume -= release_volume
+        if frozen_volume > 0:
+            self.sell_frozen_by_orderid[vt_orderid] = (vt_symbol, frozen_volume)
+        else:
+            self.sell_frozen_by_orderid.pop(vt_orderid, None)
+
+    def init_t1_position(self, strategy: StrategyTemplate) -> None:
+        """初始化时从缓存持仓同步 T+1 昨/今仓，并向网关请求最新持仓"""
+        if not strategy.t1:
+            return
+
+        strategy.position_synced = False
+        strategy.position_synced_symbols.clear()
+
+        for position in self.main_engine.get_all_positions():
+            if position.direction not in {Direction.LONG, Direction.NET}:
+                continue
+            if position.vt_symbol not in strategy.vt_symbols:
+                continue
+            strategy.sync_t1_position(
+                position.vt_symbol, position.volume, position.yd_volume
+            )
+
+        # 请求各网关刷新持仓
+        queried_gateways: set[str] = set()
+        for vt_symbol in strategy.vt_symbols:
+            contract: ContractData | None = self.main_engine.get_contract(vt_symbol)
+            if not contract:
+                continue
+            gateway_name: str = contract.gateway_name
+            if gateway_name in queried_gateways:
+                continue
+            gateway = self.main_engine.get_gateway(gateway_name)
+            if gateway and hasattr(gateway, "query_position"):
+                gateway.query_position()
+                queried_gateways.add(gateway_name)
 
     def subscribe_symbols(
         self, strategy: StrategyTemplate, vt_symbols: list[str]
@@ -460,6 +633,10 @@ class StrategyEngine(BaseEngine):
                     continue
 
                 # 对于持仓和目标数据字典，需要使用dict.update更新defaultdict
+                if name in {"yd_pos_data", "td_pos_data",
+                            "sell_frozen_data", "position_synced"}:
+                    continue
+
                 if name in {"pos_data", "target_data"}:
                     strategy_data = getattr(strategy, name)
                     strategy_data.update(value)
@@ -480,6 +657,9 @@ class StrategyEngine(BaseEngine):
                 self.main_engine.subscribe(req, contract.gateway_name)
             else:
                 self.write_log(_("行情订阅失败，找不到合约{}").format(vt_symbol), strategy)
+
+        # T+1 模式：同步经纪商持仓的昨/今仓
+        self.init_t1_position(strategy)
 
         # 推送策略事件通知初始化完成状态
         strategy.inited = True
@@ -605,6 +785,10 @@ class StrategyEngine(BaseEngine):
         data: dict = strategy.get_variables()
         data.pop("inited")      # 不保存策略状态信息
         data.pop("trading")
+        for name in {
+            "yd_pos_data", "td_pos_data", "sell_frozen_data", "position_synced"
+        }:
+            data.pop(name, None)
 
         self.strategy_data[strategy.strategy_name] = data
         save_json(self.data_filename, self.strategy_data)
@@ -617,11 +801,7 @@ class StrategyEngine(BaseEngine):
         """获取策略类参数"""
         strategy_class: type[StrategyTemplate] = self.classes[class_name]
 
-        parameters: dict = {}
-        for name in strategy_class.parameters:
-            parameters[name] = getattr(strategy_class, name)
-
-        return parameters
+        return strategy_class.get_class_parameters()
 
     def get_strategy_parameters(self, strategy_name: str) -> dict:
         """获取策略参数"""

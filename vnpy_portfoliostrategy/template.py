@@ -13,7 +13,11 @@ class StrategyTemplate(ABC):
     """组合策略模板"""
 
     author: str = ""
-    parameters: list = []
+    # T+1 开关：True=A 股 T+1（仅可卖昨仓），False=期货 T+0（可卖全部持仓）。
+    # 由策略子类在类属性上设定（参考 vnpy_ctastrategy）；T+1 持仓与可卖量
+    # 由引擎从经纪商持仓回报同步，并在下单/撤单/成交时维护冻结量。
+    t1: bool = False
+    parameters: list = ["t1"]
     variables: list = []
 
     def __init__(
@@ -36,6 +40,16 @@ class StrategyTemplate(ABC):
         self.pos_data: dict[str, int] = defaultdict(int)        # 实际持仓
         self.target_data: dict[str, int] = defaultdict(int)     # 目标持仓
 
+        # T+1 持仓管理（参考 vnpy_ctastrategy）：
+        # yd_pos_data 昨仓（T+1 可卖）、td_pos_data 今仓（T+1 不可卖）、
+        # sell_frozen_data 已发起卖出委托的冻结量；position_synced 是否已从
+        # 经纪商持仓回报同步。T+0 策略这些字段保持 0/False，可卖量等于持仓。
+        self.yd_pos_data: dict[str, int] = defaultdict(int)
+        self.td_pos_data: dict[str, int] = defaultdict(int)
+        self.sell_frozen_data: dict[str, int] = defaultdict(int)
+        self.position_synced: bool = False
+        self.position_synced_symbols: set[str] = set()
+
         # 委托缓存容器
         self.orders: dict[str, OrderData] = {}
         self.active_orderids: set[str] = set()
@@ -46,28 +60,40 @@ class StrategyTemplate(ABC):
         self.variables.insert(1, "trading")
         self.variables.insert(2, "pos_data")
         self.variables.insert(3, "target_data")
+        self.variables.insert(4, "yd_pos_data")
+        self.variables.insert(5, "td_pos_data")
+        self.variables.insert(6, "sell_frozen_data")
+        self.variables.insert(7, "position_synced")
 
         # 设置策略参数
         self.update_setting(setting)
 
     def update_setting(self, setting: dict) -> None:
         """设置策略参数"""
-        for name in self.parameters:
+        for name in self.get_class_parameter_names():
             if name in setting:
                 setattr(self, name, setting[name])
+
+    @classmethod
+    def get_class_parameter_names(cls) -> list:
+        """查取参数名列表（含基类 t1 等公共参数）"""
+        parameters: list = copy(cls.parameters)
+        if "t1" not in parameters:
+            parameters.insert(0, "t1")
+        return parameters
 
     @classmethod
     def get_class_parameters(cls) -> dict:
         """查取策略默认参数"""
         class_parameters: dict = {}
-        for name in cls.parameters:
+        for name in cls.get_class_parameter_names():
             class_parameters[name] = getattr(cls, name)
         return class_parameters
 
     def get_parameters(self) -> dict:
         """查询策略参数"""
         strategy_parameters: dict = {}
-        for name in self.parameters:
+        for name in self.get_class_parameter_names():
             strategy_parameters[name] = getattr(self, name)
         return strategy_parameters
 
@@ -116,8 +142,51 @@ class StrategyTemplate(ABC):
         """成交数据更新"""
         if trade.direction == Direction.LONG:
             self.pos_data[trade.vt_symbol] += trade.volume
+            if self.t1:
+                # 开仓计入今仓（T+1 当日不可卖）
+                self.td_pos_data[trade.vt_symbol] += trade.volume
         else:
             self.pos_data[trade.vt_symbol] -= trade.volume
+            if self.t1:
+                # 平仓消耗昨仓；冻结量由引擎在成交回报时释放
+                self.yd_pos_data[trade.vt_symbol] = max(
+                    self.yd_pos_data[trade.vt_symbol] - trade.volume, 0
+                )
+
+    def get_sellable(self, vt_symbol: str) -> int:
+        """查询可卖量
+
+        T+1：昨仓减去卖出冻结；T+0：当前持仓。卖出冻结由引擎在发起卖出委托时
+        增加、在撤单/成交回报时释放，避免在成交回报到达前重复下单超卖。
+        """
+        if self.t1:
+            return max(
+                self.yd_pos_data.get(vt_symbol, 0)
+                - self.sell_frozen_data.get(vt_symbol, 0),
+                0
+            )
+        return self.pos_data.get(vt_symbol, 0)
+
+    def sync_t1_position(self, vt_symbol: str, volume: float, yd_volume: float) -> None:
+        """从经纪商持仓回报同步 T+1 昨/今仓
+
+        ``yd_volume`` 取经纪商返回的当前可卖量。加回本策略已冻结的卖单量后作为
+        昨仓基数，避免经纪商回报已扣冻结量、策略本地又重复扣减。引擎在持仓事件
+        与初始化查询时调用。
+        """
+        position: int = int(volume)
+        local_frozen: int = int(self.sell_frozen_data.get(vt_symbol, 0))
+        yesterday_position: int = min(int(yd_volume) + local_frozen, position)
+
+        self.pos_data[vt_symbol] = position
+        self.yd_pos_data[vt_symbol] = yesterday_position
+        self.td_pos_data[vt_symbol] = max(position - yesterday_position, 0)
+        self.position_synced_symbols.add(vt_symbol)
+        self.position_synced = True
+
+    def is_position_synced(self, vt_symbol: str) -> bool:
+        """查询指定标的的 T+1 持仓是否已同步"""
+        return vt_symbol in self.position_synced_symbols
 
     def update_order(self, order: OrderData) -> None:
         """委托数据更新"""

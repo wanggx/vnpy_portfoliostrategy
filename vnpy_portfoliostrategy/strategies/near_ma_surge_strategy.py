@@ -37,6 +37,8 @@ class NearMaSurgeStrategy(StrategyTemplate):
     # 交易参数
     fixed_size: int = 500
     price_add: float = 0.0
+    # T+1 开关（A 股现货 True：仅可卖昨仓；期货 False：T+0）
+    t1: bool = True
 
     # 快速拉升检测参数
     surge_pct: float = 0.03
@@ -61,7 +63,6 @@ class NearMaSurgeStrategy(StrategyTemplate):
     ]
 
     variables: list = [
-        "subscribed_symbols",
         "target_symbols",
         "last_refresh_date",
         "surge_count",
@@ -80,7 +81,7 @@ class NearMaSurgeStrategy(StrategyTemplate):
         super().__init__(strategy_engine, strategy_name, vt_symbols, setting)
 
         # 当前已订阅的标的集合
-        self.subscribed_symbols: set[str] = set()
+        self.subscribed_symbols: set[str] = set(vt_symbols)
         # 当日标的池：vt_symbol -> name（用于日志展示）
         self.target_symbols: dict[str, str] = {}
         # 当日标的池全行数据：vt_symbol -> row(dict)，保留库表所有列
@@ -125,10 +126,12 @@ class NearMaSurgeStrategy(StrategyTemplate):
         vt_symbol: str = tick.vt_symbol
         pos: int = self.get_pos(vt_symbol)
 
-        # 2. 有持仓走卖出分支（移动止盈）
+        # 2. 有持仓走卖出分支（移动止盈；T+1 可卖量由基类 get_sellable 处理）
         if pos > 0:
             if self.check_sell_signal(vt_symbol, tick):
-                self.sell(vt_symbol, tick.last_price - self.price_add, pos)
+                sellable: int = self.get_sellable(vt_symbol)
+                if sellable > 0:
+                    self.sell(vt_symbol, tick.last_price - self.price_add, sellable)
             return
 
         # 3. 仅对当日池内、无持仓的标的做拉升检测
@@ -304,10 +307,22 @@ class NearMaSurgeStrategy(StrategyTemplate):
                 new_targets[vt_symbol] = name
                 new_universe[vt_symbol] = row
 
-        new_set: set[str] = set(new_targets.keys())
+        if not new_targets:
+            self.write_log("查询结果中没有有效标的，维持现有订阅")
+            self.put_event()
+            return
 
-        # 新订阅：在当日池但尚未订阅的
-        to_subscribe: list[str] = list(new_set - self.subscribed_symbols)
+        new_set: set[str] = set(new_targets.keys())
+        held_symbols: set[str] = {
+            vt_symbol for vt_symbol, position in self.pos_data.items()
+            if position != 0
+        }
+        required_subscriptions: set[str] = new_set | held_symbols
+
+        # 新订阅：当日池以及策略已有持仓中尚未订阅的
+        to_subscribe: list[str] = list(
+            required_subscriptions - self.subscribed_symbols
+        )
         if to_subscribe:
             self.strategy_engine.subscribe_symbols(self, to_subscribe)
 
@@ -324,11 +339,14 @@ class NearMaSurgeStrategy(StrategyTemplate):
                 self.entered.discard(vt_symbol)
 
         # 更新状态
-        self.subscribed_symbols = self.subscribed_symbols | new_set
+        self.subscribed_symbols = self.subscribed_symbols | required_subscriptions
         # 退订的从已订阅集合移除
         self.subscribed_symbols -= set(to_unsubscribe)
         self.target_symbols = new_targets
         self.universe_data = new_universe
+
+        # 动态标的池变化后重新读取经纪商持仓，确保每个标的独立完成 T+1 同步。
+        self.strategy_engine.init_t1_position(self)
 
         self.write_log(
             f"标的池刷新完成：池内 {len(new_targets)} 只，"
