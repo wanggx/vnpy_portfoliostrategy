@@ -3,6 +3,8 @@ from vnpy.trader.engine import MainEngine
 from vnpy.trader.ui import MainWindow, create_qapp
 
 from vnpy_xt import XtGateway
+from vnpy_sqlapp import SqlApp
+from vnpy_scripttrader import ScriptTraderApp
 from vnpy_portfoliostrategy import PortfolioStrategyApp
 
 
@@ -14,7 +16,10 @@ def main() -> None:
     main_engine = MainEngine(event_engine)
 
     main_engine.add_gateway(XtGateway)
+
     main_engine.add_app(PortfolioStrategyApp)
+    main_engine.add_app(SqlApp)
+    main_engine.add_app(ScriptTraderApp)
 
     main_window = MainWindow(main_engine, event_engine)
     main_window.showMaximized()

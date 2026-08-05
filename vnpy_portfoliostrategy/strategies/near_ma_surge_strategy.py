@@ -1,8 +1,10 @@
 from collections import deque
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 
 from vnpy.trader.constant import Exchange, Direction
 from vnpy.trader.object import TickData, BarData, TradeData
+
+from xtquant import xtdata
 
 from vnpy_sqlapp import APP_NAME as SQLAPP_NAME
 
@@ -262,24 +264,26 @@ class NearMaSurgeStrategy(StrategyTemplate):
         self.send_notification(msg)
 
     def refresh_universe(self) -> None:
-        """每日刷新标的池：按当天日期查库取当日成分 → 订阅新标的 → 退订不在池中且无持仓的旧标的
+        """每日刷新标的池：按前一交易日查库取当日成分 → 订阅新标的 → 退订不在池中且无持仓的旧标的
 
-        取数日期固定为当天；若当天查不到数据，不做任何订阅/退订处理，
-        维持昨天的订阅数据（现有订阅保持不变）。
+        DB 数据按前一交易日生成（screening 基于前一交易日收盘价），因此取数日期
+        取前一交易日（由 xtquant 交易日历给出，自动跨越周末/节假日）。
+        若前一交易日查不到数据，不做任何订阅/退订处理，维持昨天的订阅数据（现有订阅保持不变）。
         """
         sql_engine = self._get_sql_engine()
         if sql_engine is None:
             return
 
-        # 取数日期固定为当天；行业名/日期为可信策略参数，直接内联进 SQL
+        # 取数日期：DB 数据按前一交易日生成，直接查前一交易日的行
         today: str = datetime.now().strftime("%Y%m%d")
+        trade_date: str = self._previous_trade_date()
         sector: str = self.industry_name.replace("'", "''")
         # 显式列出全部列，按 stock_near_ma 表结构
         sql: str = (
             f"SELECT trade_date, sector_name, code, name, close, high52w, "
             f"score, near_dates, near_days, near_values "
             f"FROM {self.TABLE_NAME} "
-            f"WHERE sector_name = '{sector}' AND trade_date = '{today}'"
+            f"WHERE sector_name = '{sector}' AND trade_date = '{trade_date}'"
         )
         try:
             rows: list[dict] = sql_engine.query_all(sql)
@@ -287,11 +291,11 @@ class NearMaSurgeStrategy(StrategyTemplate):
             self.write_log(f"查询 {self.TABLE_NAME} 失败：{exc}")
             return
 
-        # 当天无数据：维持现有订阅，不做任何处理；仅标记今日已尝试，避免每 tick 重复查库
+        # 标记今日已尝试刷新（用日历当天，供 on_tick 日切检测），避免每 tick 重复查库
         self.last_refresh_date = today
         if not rows:
             self.write_log(
-                f"当日(trade_date={today})行业“{self.industry_name}”无数据，维持现有订阅"
+                f"前一交易日(trade_date={trade_date})行业“{self.industry_name}”无数据，维持现有订阅"
             )
             self.put_event()
             return
@@ -349,7 +353,8 @@ class NearMaSurgeStrategy(StrategyTemplate):
         self.strategy_engine.init_t1_position(self)
 
         self.write_log(
-            f"标的池刷新完成：池内 {len(new_targets)} 只，"
+            f"标的池刷新完成：trade_date={trade_date} 行业“{self.industry_name}” "
+            f"池内 {len(new_targets)} 只，"
             f"新订阅 {len(to_subscribe)} 只，退订 {len(to_unsubscribe)} 只"
         )
         self.put_event()
@@ -360,6 +365,33 @@ class NearMaSurgeStrategy(StrategyTemplate):
         if sql_engine is None:
             self.write_log(f"未加载 SqlApp（{SQLAPP_NAME}），无法刷新标的池")
         return sql_engine
+
+    def _previous_trade_date(self) -> str:
+        """前一交易日（严格小于今天的最大交易日，A 股自动跨越周末/节假日）
+
+        优先用 xtquant 交易日历（``xtdata.get_trading_dates``，市场取 SH）；
+        若 xtdata 未连接或取数失败，回退为按自然日往回跳过周末的近似值并写日志。
+        """
+        today: datetime = datetime.now()
+        today_str: str = today.strftime("%Y%m%d")
+        try:
+            # 往前看 15 天，足够跨越周末和长假（春节/国庆最长 7 天）
+            start: str = (today - timedelta(days=15)).strftime("%Y%m%d")
+            dates = xtdata.get_trading_dates("SH", start_time=start, end_time=today_str, count=-1)
+            trade_days: list[str] = [
+                datetime.fromtimestamp(ts / 1000).strftime("%Y%m%d") for ts in dates
+            ]
+            prev_days: list[str] = [d for d in trade_days if d < today_str]
+            if prev_days:
+                return max(prev_days)
+            self.write_log("xtquant 未返回小于今天的交易日，回退近似前一交易日")
+        except Exception as exc:  # noqa: BLE001 - 回退近似值，不影响策略运行
+            self.write_log(f"xtquant 取前一交易日失败，回退近似：{exc}")
+        # 回退：往回跳过周末（不考虑节假日）
+        d: datetime = today - timedelta(days=1)
+        while d.weekday() >= 5:  # 5=周六, 6=周日
+            d -= timedelta(days=1)
+        return d.strftime("%Y%m%d")
 
     @staticmethod
     def _code_to_vt_symbol(code: str) -> str:
