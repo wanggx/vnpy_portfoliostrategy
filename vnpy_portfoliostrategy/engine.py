@@ -1,6 +1,7 @@
 import importlib
 import glob
 import traceback
+from typing import Any
 from collections import defaultdict
 from pathlib import Path
 from types import ModuleType
@@ -871,3 +872,14 @@ class StrategyEngine(BaseEngine):
             subject = _("组合策略引擎")
 
         self.main_engine.send_notification(msg, subject)
+
+    def send_wecom(self, msg: str, strategy: StrategyTemplate | None = None) -> None:
+        """通过企业微信推送消息"""
+        if strategy:
+            subject: str = f"{strategy.strategy_name}"
+        else:
+            subject = _("组合策略引擎")
+
+        wecom_engine: Any = self.main_engine.get_engine("wecom")
+        if wecom_engine:
+            wecom_engine.send_wecom(f"{subject}\n{msg}")

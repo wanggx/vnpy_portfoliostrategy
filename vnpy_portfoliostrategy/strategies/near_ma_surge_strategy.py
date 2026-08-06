@@ -1,8 +1,8 @@
 from collections import deque
 from datetime import datetime, time, timedelta
 
-from vnpy.trader.constant import Exchange, Direction
-from vnpy.trader.object import TickData, BarData, TradeData
+from vnpy.trader.constant import Exchange, Direction, Status
+from vnpy.trader.object import TickData, BarData, TradeData, OrderData
 
 from xtquant import xtdata
 
@@ -177,7 +177,6 @@ class NearMaSurgeStrategy(StrategyTemplate):
                 f"涨幅 {gain * 100:.2f}% 价格 {tick.last_price} 数量 {self.fixed_size}"
             )
             self.write_log(msg)
-            self.send_notification(msg)
             self.put_event()
 
     def on_bars(self, bars: dict[str, BarData]) -> None:
@@ -185,7 +184,7 @@ class NearMaSurgeStrategy(StrategyTemplate):
         return
 
     def update_trade(self, trade: TradeData) -> None:
-        """成交数据更新：维护开仓价，平仓后清理止盈追踪"""
+        """成交数据更新：维护开仓价，平仓后清理止盈追踪，推送企业微信通知"""
         super().update_trade(trade)
 
         vt_symbol: str = trade.vt_symbol
@@ -200,6 +199,33 @@ class NearMaSurgeStrategy(StrategyTemplate):
                 self.entry_prices.pop(vt_symbol, None)
                 self.max_profit_pct.pop(vt_symbol, None)
                 self.entered.discard(vt_symbol)
+
+        name: str = self.target_symbols.get(vt_symbol, "")
+        direction: str = trade.direction.value if trade.direction else ""
+        offset: str = trade.offset.value if trade.offset else ""
+        self.send_wecom(
+            f"成交通知 {vt_symbol}({name}) 方向 {direction} 开平 {offset} "
+            f"价格 {trade.price:.2f} 数量 {trade.volume}"
+        )
+
+    def update_order(self, order: OrderData) -> None:
+        """委托数据更新：仅在关键状态变化时推送企业微信通知"""
+        super().update_order(order)
+
+        # 过滤 SUBMITTING/NOTTRADED 等中间状态噪声
+        if order.status not in {
+            Status.ALLTRADED, Status.PARTTRADED,
+            Status.CANCELLED, Status.REJECTED
+        }:
+            return
+        name: str = self.target_symbols.get(order.vt_symbol, "")
+        direction: str = order.direction.value if order.direction else ""
+        offset: str = order.offset.value if order.offset else ""
+        status: str = order.status.value if order.status else ""
+        self.send_wecom(
+            f"委托通知 {order.vt_symbol}({name}) 状态 {status} 方向 {direction} "
+            f"开平 {offset} 价格 {order.price:.2f} 委托 {order.volume} 成交 {order.traded}"
+        )
 
     def check_sell_signal(self, vt_symbol: str, tick: TickData) -> bool:
         """卖出信号判定：移动止盈
@@ -253,7 +279,7 @@ class NearMaSurgeStrategy(StrategyTemplate):
         max_profit: float,
         reason: str,
     ) -> None:
-        """记录卖出信号日志与通知"""
+        """记录卖出信号日志"""
         name: str = self.target_symbols.get(vt_symbol, "")
         msg: str = (
             f"卖出信号 {vt_symbol}({name}) {reason} "
@@ -261,7 +287,6 @@ class NearMaSurgeStrategy(StrategyTemplate):
             f"最大收益 {max_profit * 100:.2f}%"
         )
         self.write_log(msg)
-        self.send_notification(msg)
 
     def refresh_universe(self) -> None:
         """每日刷新标的池：按前一交易日查库取当日成分 → 订阅新标的 → 退订不在池中且无持仓的旧标的

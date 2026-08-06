@@ -730,6 +730,10 @@ class BacktestingEngine:
         """通过已配置渠道推送通知"""
         pass
 
+    def send_wecom(self, msg: str, strategy: StrategyTemplate | None = None) -> None:
+        """回测时不发送企业微信消息"""
+        pass
+
     def sync_strategy_data(self, strategy: StrategyTemplate) -> None:
         """保存策略数据到文件"""
         pass

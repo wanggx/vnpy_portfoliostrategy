@@ -367,6 +367,11 @@ class StrategyTemplate(ABC):
 
     send_email = send_notification
 
+    def send_wecom(self, msg: str) -> None:
+        """通过企业微信推送消息"""
+        if self.inited:
+            self.strategy_engine.send_wecom(msg, self)
+
     def sync_data(self) -> None:
         """同步策略状态数据到文件"""
         if self.trading:
