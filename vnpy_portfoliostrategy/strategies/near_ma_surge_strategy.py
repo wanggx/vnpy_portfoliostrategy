@@ -133,7 +133,7 @@ class NearMaSurgeStrategy(StrategyTemplate):
             if self.check_sell_signal(vt_symbol, tick):
                 sellable: int = self.get_sellable(vt_symbol)
                 if sellable > 0:
-                    self.sell(vt_symbol, tick.last_price - self.price_add, sellable)
+                    self.sell(vt_symbol, tick.last_price - self.price_add, sellable, mark="移动止盈卖出")
             return
 
         # 3. 仅对当日池内、无持仓的标的做拉升检测
@@ -163,7 +163,7 @@ class NearMaSurgeStrategy(StrategyTemplate):
         # 4. 拉升判定：窗口内涨幅 >= surge_pct
         gain: float = (tick.last_price - ref_price) / ref_price
         if gain >= self.surge_pct:
-            self.buy(vt_symbol, tick.last_price + self.price_add, self.fixed_size)
+            self.buy(vt_symbol, tick.last_price + self.price_add, self.fixed_size, mark="快速拉升买入")
             self.entered.add(vt_symbol)
             self.surge_count += 1
 

@@ -71,6 +71,7 @@ class StrategyEngine(BaseEngine):
 
         self.symbol_strategy_map: dict[str, list[StrategyTemplate]] = defaultdict(list)
         self.orderid_strategy_map: dict[str, StrategyTemplate] = {}
+        self.orderid_reference_map: dict[str, str] = {}                 # vt_orderid: reference
 
         self.init_executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=1)
 
@@ -143,6 +144,12 @@ class StrategyEngine(BaseEngine):
         """委托数据推送"""
         order: OrderData = event.data
 
+        # 部分网关在后续委托推送中不再携带 reference，用本地缓存补回
+        order.reference = self.orderid_reference_map.get(
+            order.vt_orderid,
+            order.reference
+        )
+
         strategy: StrategyTemplate | None = self.orderid_strategy_map.get(order.vt_orderid, None)
         if not strategy:
             return
@@ -154,6 +161,10 @@ class StrategyEngine(BaseEngine):
                 self.release_t1_sell_frozen(strategy, order.vt_orderid, frozen[1])
 
         self.call_strategy_func(strategy, strategy.update_order, order)
+
+        # 委托终结后清理本地缓存
+        if not order.is_active():
+            self.orderid_reference_map.pop(order.vt_orderid, None)
 
     def process_trade_event(self, event: Event) -> None:
         """成交数据推送"""
@@ -202,6 +213,7 @@ class StrategyEngine(BaseEngine):
         volume: float,
         lock: bool,
         net: bool,
+        mark: str = "",
     ) -> list:
         """发送委托"""
         contract: ContractData | None = self.main_engine.get_contract(vt_symbol)
@@ -224,7 +236,7 @@ class StrategyEngine(BaseEngine):
             type=OrderType.LIMIT,
             price=price,
             volume=volume,
-            reference=f"{APP_NAME}_{strategy.strategy_name}"
+            reference=self.create_order_reference(strategy, mark)
         )
 
         req_list: list[OrderRequest] = self.main_engine.convert_order_request(
@@ -245,6 +257,8 @@ class StrategyEngine(BaseEngine):
 
             vt_orderids.append(vt_orderid)
 
+            self.orderid_reference_map[vt_orderid] = req.reference
+
             self.main_engine.update_order_request(req, vt_orderid, contract.gateway_name)
 
             self.orderid_strategy_map[vt_orderid] = strategy
@@ -254,6 +268,20 @@ class StrategyEngine(BaseEngine):
                 self.freeze_t1_sell(strategy, vt_symbol, vt_orderid, req.volume)
 
         return vt_orderids
+
+    @staticmethod
+    def create_order_reference(strategy: StrategyTemplate, mark: str) -> str:
+        """构造委托 reference：APP_NAME_策略名[:mark]"""
+        reference: str = f"{APP_NAME}_{strategy.strategy_name}"
+        if mark:
+            reference = f"{reference}:{mark}"
+        return reference
+
+    @staticmethod
+    def get_order_mark(reference: str) -> str:
+        """从 reference 中提取触发标记（mark）"""
+        _, separator, mark = reference.partition(":")
+        return mark if separator else ""
 
     def cancel_order(self, strategy: StrategyTemplate, vt_orderid: str) -> None:
         """委托撤单"""

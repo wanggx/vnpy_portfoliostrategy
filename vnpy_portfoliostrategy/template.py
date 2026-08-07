@@ -195,21 +195,21 @@ class StrategyTemplate(ABC):
         if not order.is_active() and order.vt_orderid in self.active_orderids:
             self.active_orderids.remove(order.vt_orderid)
 
-    def buy(self, vt_symbol: str, price: float, volume: float, lock: bool = False, net: bool = False) -> list[str]:
+    def buy(self, vt_symbol: str, price: float, volume: float, lock: bool = False, net: bool = False, mark: str = "") -> list[str]:
         """买入开仓"""
-        return self.send_order(vt_symbol, Direction.LONG, Offset.OPEN, price, volume, lock, net)
+        return self.send_order(vt_symbol, Direction.LONG, Offset.OPEN, price, volume, lock, net, mark)
 
-    def sell(self, vt_symbol: str, price: float, volume: float, lock: bool = False, net: bool = False) -> list[str]:
+    def sell(self, vt_symbol: str, price: float, volume: float, lock: bool = False, net: bool = False, mark: str = "") -> list[str]:
         """卖出平仓"""
-        return self.send_order(vt_symbol, Direction.SHORT, Offset.CLOSE, price, volume, lock, net)
+        return self.send_order(vt_symbol, Direction.SHORT, Offset.CLOSE, price, volume, lock, net, mark)
 
-    def short(self, vt_symbol: str, price: float, volume: float, lock: bool = False, net: bool = False) -> list[str]:
+    def short(self, vt_symbol: str, price: float, volume: float, lock: bool = False, net: bool = False, mark: str = "") -> list[str]:
         """卖出开仓"""
-        return self.send_order(vt_symbol, Direction.SHORT, Offset.OPEN, price, volume, lock, net)
+        return self.send_order(vt_symbol, Direction.SHORT, Offset.OPEN, price, volume, lock, net, mark)
 
-    def cover(self, vt_symbol: str, price: float, volume: float, lock: bool = False, net: bool = False) -> list[str]:
+    def cover(self, vt_symbol: str, price: float, volume: float, lock: bool = False, net: bool = False, mark: str = "") -> list[str]:
         """买入平仓"""
-        return self.send_order(vt_symbol, Direction.LONG, Offset.CLOSE, price, volume, lock, net)
+        return self.send_order(vt_symbol, Direction.LONG, Offset.CLOSE, price, volume, lock, net, mark)
 
     def send_order(
         self,
@@ -220,11 +220,12 @@ class StrategyTemplate(ABC):
         volume: float,
         lock: bool = False,
         net: bool = False,
+        mark: str = "",
     ) -> list[str]:
         """发送委托"""
         if self.trading:
             vt_orderids: list = self.strategy_engine.send_order(
-                self, vt_symbol, direction, offset, price, volume, lock, net
+                self, vt_symbol, direction, offset, price, volume, lock, net, mark
             )
 
             for vt_orderid in vt_orderids:
@@ -233,6 +234,12 @@ class StrategyTemplate(ABC):
             return vt_orderids
         else:
             return []
+
+    @staticmethod
+    def get_order_mark(order: OrderData) -> str:
+        """从委托 reference 中提取触发标记（mark）"""
+        _, separator, mark = order.reference.partition(":")
+        return mark if separator else ""
 
     def cancel_order(self, vt_orderid: str) -> None:
         """撤销委托"""

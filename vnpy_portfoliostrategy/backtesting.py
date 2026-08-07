@@ -21,7 +21,7 @@ from vnpy.trader.optimize import (
     run_ga_optimization
 )
 
-from .base import EngineType
+from .base import EngineType, APP_NAME
 from .locale import _
 from .template import StrategyTemplate
 
@@ -686,13 +686,18 @@ class BacktestingEngine:
         price: float,
         volume: float,
         lock: bool,
-        net: bool
+        net: bool,
+        mark: str = ""
     ) -> list[str]:
         """发送委托"""
         price = round_to(price, self.priceticks[vt_symbol])
         symbol, exchange = extract_vt_symbol(vt_symbol)
 
         self.limit_order_count += 1
+
+        reference: str = f"{APP_NAME}_{strategy.strategy_name}"
+        if mark:
+            reference = f"{reference}:{mark}"
 
         order: OrderData = OrderData(
             symbol=symbol,
@@ -705,6 +710,7 @@ class BacktestingEngine:
             status=Status.SUBMITTING,
             datetime=self.datetime,
             gateway_name=self.gateway_name,
+            reference=reference,
         )
 
         self.active_limit_orders[order.vt_orderid] = order
