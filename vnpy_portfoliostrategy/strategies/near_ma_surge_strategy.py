@@ -26,8 +26,8 @@ class NearMaSurgeStrategy(StrategyTemplate):
     退订不在当日池中且无持仓的旧标的；在无持仓标的上用 tick 实时检测「快速拉升」
     （5 分钟内涨幅 >= surge_pct），命中即开 fixed_size 股固定仓位并持有。
 
-    卖出信号为移动止盈（参数固定）：记录开仓后最大收益率，回撤超过 10% 卖出；
-    最大收益 >= 10% 时最低保底 5%、>= 5% 时最低保底 2%，跌破保底即卖。
+    卖出信号（参数固定）：相对开仓价亏损超过 3% 止损；记录开仓后最大收益率，
+    回撤超过 10% 卖出；最大收益 >= 10% 时最低保底 5%、>= 5% 时最低保底 2%，跌破保底即卖。
     """
 
     author: str = "用Python的交易员"
@@ -45,11 +45,13 @@ class NearMaSurgeStrategy(StrategyTemplate):
     # 快速拉升检测参数
     surge_pct: float = 0.03
     surge_window: int = 300        # 拉升检测时间窗口（秒），默认 5 分钟
+    MIN_SURGE_SPAN: int = 180      # 窗口至少覆盖 3 分钟才判定拉升
 
     # 每日盘前刷新订阅标的池的固定时刻（09:15）
     REFRESH_TIME: time = time(9, 15)
 
-    # 移动止盈参数（固定，不暴露为策略参数）
+    # 止损 / 移动止盈参数（固定，不暴露为策略参数）
+    STOP_LOSS_PCT: float = 0.03          # 固定止损：相对开仓价亏损 3% 即卖
     MAX_DRAWDOWN_PCT: float = 0.10       # 最大回撤上限：相对最大收益回撤 10% 即卖
     TIER_HIGH_PCT: float = 0.10          # 最大收益 >= 10% 时，最低保底 5%
     TIER_HIGH_FLOOR: float = 0.05
@@ -128,12 +130,14 @@ class NearMaSurgeStrategy(StrategyTemplate):
         vt_symbol: str = tick.vt_symbol
         pos: int = self.get_pos(vt_symbol)
 
-        # 2. 有持仓走卖出分支（移动止盈；T+1 可卖量由基类 get_sellable 处理）
+        # 2. 有持仓走卖出分支（止损 / 移动止盈；T+1 可卖量由基类 get_sellable 处理）
         if pos > 0:
-            if self.check_sell_signal(vt_symbol, tick):
+            sell_msg: str = self.check_sell_signal(vt_symbol, tick)
+            if sell_msg:
                 sellable: int = self.get_sellable(vt_symbol)
                 if sellable > 0:
-                    self.sell(vt_symbol, tick.last_price - self.price_add, sellable, mark="移动止盈卖出")
+                    self.sell(vt_symbol, tick.last_price - self.price_add, sellable, mark=sell_msg)
+                    self.send_wecom(sell_msg)
             return
 
         # 3. 仅对当日池内、无持仓的标的做拉升检测
@@ -152,8 +156,8 @@ class NearMaSurgeStrategy(StrategyTemplate):
         while window and (cutoff - window[0][0]).total_seconds() > self.surge_window:
             window.popleft()
 
-        # 窗口样本不足时不判定
-        if len(window) < 2:
+        # 窗口覆盖时长不足 3 分钟时不判定，不看 tick 个数
+        if (cutoff - window[0][0]).total_seconds() < self.MIN_SURGE_SPAN:
             return
 
         ref_price: float = window[0][1]
@@ -163,7 +167,8 @@ class NearMaSurgeStrategy(StrategyTemplate):
         # 4. 拉升判定：窗口内涨幅 >= surge_pct
         gain: float = (tick.last_price - ref_price) / ref_price
         if gain >= self.surge_pct:
-            self.buy(vt_symbol, tick.last_price + self.price_add, self.fixed_size, mark="快速拉升买入")
+            mark: str = f"涨幅 {gain * 100:.2f}% 价格 {tick.last_price} 数量 {self.fixed_size}"
+            self.buy(vt_symbol, tick.last_price + self.price_add, self.fixed_size, mark=mark)
             self.entered.add(vt_symbol)
             self.surge_count += 1
 
@@ -172,11 +177,9 @@ class NearMaSurgeStrategy(StrategyTemplate):
             self.max_profit_pct[vt_symbol] = 0.0
 
             name: str = self.target_symbols.get(vt_symbol, "")
-            msg: str = (
-                f"快速拉升买入 {vt_symbol}({name}) "
-                f"涨幅 {gain * 100:.2f}% 价格 {tick.last_price} 数量 {self.fixed_size}"
-            )
+            msg: str = f"快速拉升买入 {vt_symbol}({name}) {mark}"
             self.write_log(msg)
+            self.send_wecom(msg)
             self.put_event()
 
     def on_bars(self, bars: dict[str, BarData]) -> None:
@@ -227,20 +230,23 @@ class NearMaSurgeStrategy(StrategyTemplate):
             f"开平 {offset} 价格 {order.price:.2f} 委托 {order.volume} 成交 {order.traded}"
         )
 
-    def check_sell_signal(self, vt_symbol: str, tick: TickData) -> bool:
-        """卖出信号判定：移动止盈
+    def check_sell_signal(self, vt_symbol: str, tick: TickData) -> str:
+        """卖出信号判定：固定止损 + 移动止盈
 
         规则（参数固定，不可配置）：
-        1. 记录开仓后最大收益率 ``max_profit``；
-        2. 当前收益相对最大收益回撤 >= MAX_DRAWDOWN_PCT(10%) → 卖出；
-        3. 保底收益线（取两者较大者生效）：
+        1. 相对开仓价亏损 >= STOP_LOSS_PCT(3%) → 止损卖出；
+        2. 记录开仓后最大收益率 ``max_profit``；
+        3. 当前收益相对最大收益回撤 >= MAX_DRAWDOWN_PCT(10%) → 卖出；
+        4. 保底收益线（取两者较大者生效）：
            - 最大收益 >= 10% → 最低保证 5%；
            - 最大收益 >= 5%  → 最低保证 2%；
            当前收益跌破保底线 → 卖出。
+
+        命中则返回卖出说明字符串，否则返回空串。
         """
         entry_price: float | None = self.entry_prices.get(vt_symbol, None)
         if not entry_price or entry_price <= 0 or not tick.last_price:
-            return False
+            return ""
 
         profit_pct: float = (tick.last_price - entry_price) / entry_price
 
@@ -250,14 +256,22 @@ class NearMaSurgeStrategy(StrategyTemplate):
             max_profit = profit_pct
             self.max_profit_pct[vt_symbol] = max_profit
 
-        # 1) 回撤止盈：相对最大收益回撤超 MAX_DRAWDOWN_PCT
+        # 1) 固定止损：相对开仓价亏损超 STOP_LOSS_PCT
+        if profit_pct <= -self.STOP_LOSS_PCT:
+            return self._log_sell(
+                vt_symbol, tick, profit_pct, max_profit,
+                f"止损 亏损 {abs(profit_pct) * 100:.2f}% 超过 {self.STOP_LOSS_PCT * 100:.0f}%",
+            )
+
+        # 2) 回撤止盈：相对最大收益回撤超 MAX_DRAWDOWN_PCT
         drawdown: float = max_profit - profit_pct
         if drawdown >= self.MAX_DRAWDOWN_PCT:
-            self._log_sell(vt_symbol, tick, profit_pct, max_profit,
-                           f"回撤 {drawdown * 100:.2f}% 超过 {self.MAX_DRAWDOWN_PCT * 100:.0f}%")
-            return True
+            return self._log_sell(
+                vt_symbol, tick, profit_pct, max_profit,
+                f"回撤 {drawdown * 100:.2f}% 超过 {self.MAX_DRAWDOWN_PCT * 100:.0f}%",
+            )
 
-        # 2) 保底收益线
+        # 3) 保底收益线
         floor: float = 0.0
         if max_profit >= self.TIER_HIGH_PCT:
             floor = self.TIER_HIGH_FLOOR
@@ -265,11 +279,12 @@ class NearMaSurgeStrategy(StrategyTemplate):
             floor = self.TIER_LOW_FLOOR
 
         if floor > 0 and profit_pct < floor:
-            self._log_sell(vt_symbol, tick, profit_pct, max_profit,
-                           f"跌破保底 {floor * 100:.0f}%")
-            return True
+            return self._log_sell(
+                vt_symbol, tick, profit_pct, max_profit,
+                f"跌破保底 {floor * 100:.0f}%",
+            )
 
-        return False
+        return ""
 
     def _log_sell(
         self,
@@ -278,8 +293,8 @@ class NearMaSurgeStrategy(StrategyTemplate):
         profit_pct: float,
         max_profit: float,
         reason: str,
-    ) -> None:
-        """记录卖出信号日志"""
+    ) -> str:
+        """记录卖出信号日志，并返回同一条说明供 mark / 企微复用"""
         name: str = self.target_symbols.get(vt_symbol, "")
         msg: str = (
             f"卖出信号 {vt_symbol}({name}) {reason} "
@@ -287,6 +302,7 @@ class NearMaSurgeStrategy(StrategyTemplate):
             f"最大收益 {max_profit * 100:.2f}%"
         )
         self.write_log(msg)
+        return msg
 
     def refresh_universe(self) -> None:
         """每日刷新标的池：按前一交易日查库取当日成分 → 订阅新标的 → 退订不在池中且无持仓的旧标的
