@@ -38,6 +38,7 @@ class StrategyTemplate(ABC):
 
         # 持仓数据字典
         self.pos_data: dict[str, int] = defaultdict(int)        # 实际持仓
+        self.pos_price_data: dict[str, float] = {}              # 经纪商持仓均价
         self.target_data: dict[str, int] = defaultdict(int)     # 目标持仓
 
         # T+1 持仓管理（参考 vnpy_ctastrategy）：
@@ -59,11 +60,12 @@ class StrategyTemplate(ABC):
         self.variables.insert(0, "inited")
         self.variables.insert(1, "trading")
         self.variables.insert(2, "pos_data")
-        self.variables.insert(3, "target_data")
-        self.variables.insert(4, "yd_pos_data")
-        self.variables.insert(5, "td_pos_data")
-        self.variables.insert(6, "sell_frozen_data")
-        self.variables.insert(7, "position_synced")
+        self.variables.insert(3, "pos_price_data")
+        self.variables.insert(4, "target_data")
+        self.variables.insert(5, "yd_pos_data")
+        self.variables.insert(6, "td_pos_data")
+        self.variables.insert(7, "sell_frozen_data")
+        self.variables.insert(8, "position_synced")
 
         # 设置策略参数
         self.update_setting(setting)
@@ -167,12 +169,20 @@ class StrategyTemplate(ABC):
             )
         return self.pos_data.get(vt_symbol, 0)
 
-    def sync_t1_position(self, vt_symbol: str, volume: float, yd_volume: float) -> None:
+    def sync_t1_position(
+        self,
+        vt_symbol: str,
+        volume: float,
+        yd_volume: float,
+        price: float = 0,
+    ) -> None:
         """从经纪商持仓回报同步 T+1 昨/今仓
 
         ``yd_volume`` 取经纪商返回的当前可卖量。加回本策略已冻结的卖单量后作为
         昨仓基数，避免经纪商回报已扣冻结量、策略本地又重复扣减。引擎在持仓事件
         与初始化查询时调用。
+
+        ``price`` 为经纪商持仓均价，写入 ``pos_price_data``；空仓时清除对应记录。
         """
         position: int = int(volume)
         local_frozen: int = int(self.sell_frozen_data.get(vt_symbol, 0))
@@ -181,8 +191,17 @@ class StrategyTemplate(ABC):
         self.pos_data[vt_symbol] = position
         self.yd_pos_data[vt_symbol] = yesterday_position
         self.td_pos_data[vt_symbol] = max(position - yesterday_position, 0)
+        if position > 0:
+            if price > 0:
+                self.pos_price_data[vt_symbol] = price
+        else:
+            self.pos_price_data.pop(vt_symbol, None)
         self.position_synced_symbols.add(vt_symbol)
         self.position_synced = True
+
+    def get_pos_price(self, vt_symbol: str) -> float:
+        """查询经纪商同步的持仓均价"""
+        return self.pos_price_data.get(vt_symbol, 0.0)
 
     def is_position_synced(self, vt_symbol: str) -> bool:
         """查询指定标的的 T+1 持仓是否已同步"""

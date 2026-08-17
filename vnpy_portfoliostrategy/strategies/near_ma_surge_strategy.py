@@ -114,10 +114,57 @@ class NearMaSurgeStrategy(StrategyTemplate):
         self.write_log("策略启动")
         # 启动即刷新当日标的池，不等次日 refresh 时刻
         self.refresh_universe()
+        self._sync_tracking_state()
 
     def on_stop(self) -> None:
         """策略停止回调"""
         self.write_log("策略停止")
+
+    def sync_t1_position(
+        self,
+        vt_symbol: str,
+        volume: float,
+        yd_volume: float,
+        price: float = 0,
+    ) -> None:
+        """同步 T+1 持仓，并用经纪商持仓均价恢复开仓成本"""
+        super().sync_t1_position(vt_symbol, volume, yd_volume, price)
+
+        broker_price: float = self.get_pos_price(vt_symbol)
+        if int(volume) > 0:
+            changed: bool = False
+            if broker_price > 0 and self.entry_prices.get(vt_symbol) != broker_price:
+                self.entry_prices[vt_symbol] = broker_price
+                changed = True
+            self.entered.add(vt_symbol)
+            if changed:
+                self._sync_tracking_state()
+        else:
+            if vt_symbol in self.entry_prices or vt_symbol in self.max_profit_pct:
+                self.entry_prices.pop(vt_symbol, None)
+                self.max_profit_pct.pop(vt_symbol, None)
+                self._sync_tracking_state()
+            self.entered.discard(vt_symbol)
+
+    def _sync_tracking_state(self) -> None:
+        """持久化 entry_prices / max_profit_pct 到 portfolio_strategy_data.json"""
+        self.sync_data()
+
+    def _init_max_profit_from_tick(self, vt_symbol: str, tick: TickData) -> None:
+        """JSON 无历史峰值时，用首个 tick 相对开仓价初始化 max_profit_pct"""
+        if not tick.last_price or tick.last_price <= 0:
+            return
+
+        entry_price: float = self.entry_prices.get(vt_symbol) or self.get_pos_price(vt_symbol)
+        if entry_price <= 0:
+            return
+
+        if vt_symbol not in self.entry_prices:
+            self.entry_prices[vt_symbol] = entry_price
+
+        profit_pct: float = (tick.last_price - entry_price) / entry_price
+        self.max_profit_pct[vt_symbol] = profit_pct
+        self._sync_tracking_state()
 
     def on_tick(self, tick: TickData) -> None:
         """行情推送回调：日切刷新 + 拉升检测 + 买入/卖出"""
@@ -132,6 +179,8 @@ class NearMaSurgeStrategy(StrategyTemplate):
 
         # 2. 有持仓走卖出分支（止损 / 移动止盈；T+1 可卖量由基类 get_sellable 处理）
         if pos > 0:
+            if vt_symbol not in self.max_profit_pct:
+                self._init_max_profit_from_tick(vt_symbol, tick)
             sell_msg: str = self.check_sell_signal(vt_symbol, tick)
             if sell_msg:
                 sellable: int = self.get_sellable(vt_symbol)
@@ -175,6 +224,7 @@ class NearMaSurgeStrategy(StrategyTemplate):
             # 记录开仓价（用触发买入的现价近似）与初始最大收益
             self.entry_prices[vt_symbol] = tick.last_price
             self.max_profit_pct[vt_symbol] = 0.0
+            self._sync_tracking_state()
 
             name: str = self.target_symbols.get(vt_symbol, "")
             msg: str = f"快速拉升买入 {vt_symbol}({name}) {mark}"
@@ -191,17 +241,27 @@ class NearMaSurgeStrategy(StrategyTemplate):
         super().update_trade(trade)
 
         vt_symbol: str = trade.vt_symbol
+        tracking_changed: bool = False
         if trade.direction == Direction.LONG:
             # 开仓：用实际成交价修正开仓价（买入信号时用的是触发价近似）
             if vt_symbol not in self.entry_prices:
                 self.entry_prices[vt_symbol] = trade.price
                 self.max_profit_pct[vt_symbol] = 0.0
+                tracking_changed = True
+            elif self.entry_prices.get(vt_symbol) != trade.price:
+                self.entry_prices[vt_symbol] = trade.price
+                tracking_changed = True
         else:
             # 平仓后仓位归零则清理追踪，允许后续新一轮拉升再进
             if self.get_pos(vt_symbol) <= 0:
-                self.entry_prices.pop(vt_symbol, None)
-                self.max_profit_pct.pop(vt_symbol, None)
+                if vt_symbol in self.entry_prices or vt_symbol in self.max_profit_pct:
+                    self.entry_prices.pop(vt_symbol, None)
+                    self.max_profit_pct.pop(vt_symbol, None)
+                    tracking_changed = True
                 self.entered.discard(vt_symbol)
+
+        if tracking_changed:
+            self._sync_tracking_state()
 
         name: str = self.target_symbols.get(vt_symbol, "")
         direction: str = trade.direction.value if trade.direction else ""
@@ -255,6 +315,7 @@ class NearMaSurgeStrategy(StrategyTemplate):
         if profit_pct > max_profit:
             max_profit = profit_pct
             self.max_profit_pct[vt_symbol] = max_profit
+            self._sync_tracking_state()
 
         # 1) 固定止损：相对开仓价亏损超 STOP_LOSS_PCT
         if profit_pct <= -self.STOP_LOSS_PCT:

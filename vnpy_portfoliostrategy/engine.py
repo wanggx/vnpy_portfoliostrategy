@@ -199,7 +199,7 @@ class StrategyEngine(BaseEngine):
             if not strategy.t1:
                 continue
             strategy.sync_t1_position(
-                position.vt_symbol, position.volume, position.yd_volume
+                position.vt_symbol, position.volume, position.yd_volume, position.price
             )
             self.put_strategy_event(strategy)
 
@@ -411,7 +411,7 @@ class StrategyEngine(BaseEngine):
             if position.vt_symbol not in strategy.vt_symbols:
                 continue
             strategy.sync_t1_position(
-                position.vt_symbol, position.volume, position.yd_volume
+                position.vt_symbol, position.volume, position.yd_volume, position.price
             )
 
         # 请求各网关刷新持仓
@@ -666,7 +666,7 @@ class StrategyEngine(BaseEngine):
                             "sell_frozen_data", "position_synced"}:
                     continue
 
-                if name in {"pos_data", "target_data"}:
+                if name in {"pos_data", "target_data", "pos_price_data"}:
                     strategy_data = getattr(strategy, name)
                     strategy_data.update(value)
                 # 对于其他int/float/str/bool字段则可以直接赋值
