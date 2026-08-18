@@ -105,16 +105,53 @@ class NearMaSurgeStrategy(StrategyTemplate):
         self.max_profit_pct: dict[str, float] = {}
 
     def on_init(self) -> None:
-        """策略初始化回调"""
+        """策略初始化回调
+
+        引擎在 ``on_init`` 返回后即按 ``vt_symbols`` 订阅并把 ``inited`` 置 True，
+        此后就会收到 ``on_tick``。此处仅还原订阅集合；当日标的池刷新由
+        ``on_tick`` 日切逻辑触发。
+        """
         self.write_log("策略初始化")
+        self._restore_subscribed_symbols()
         self.load_bars(1)
 
     def on_start(self) -> None:
         """策略启动回调"""
         self.write_log("策略启动")
-        # 启动即刷新当日标的池，不等次日 refresh 时刻
-        self.refresh_universe()
-        self._sync_tracking_state()
+
+    def _restore_subscribed_symbols(self) -> None:
+        """还原订阅集合并补订行情
+
+        ``on_init`` 时引擎尚未把 data JSON 写回实例，因此同时读取内存字段和
+        ``strategy_data``。``vt_symbols`` 已由 setting 载入。
+        """
+        restored: set[str] = set(self.vt_symbols)
+        restored.update(self.target_symbols.keys())
+        restored.update(
+            vt_symbol for vt_symbol, position in self.pos_data.items()
+            if position != 0
+        )
+
+        data: dict = self.strategy_engine.strategy_data.get(self.strategy_name, {}) or {}
+        saved_targets: dict = data.get("target_symbols") or {}
+        if isinstance(saved_targets, dict):
+            restored.update(saved_targets.keys())
+        saved_pos: dict = data.get("pos_data") or {}
+        if isinstance(saved_pos, dict):
+            restored.update(
+                vt_symbol for vt_symbol, position in saved_pos.items()
+                if position
+            )
+
+        to_subscribe: list[str] = [
+            vt_symbol for vt_symbol in restored
+            if vt_symbol not in self.subscribed_symbols
+        ]
+        if to_subscribe:
+            self.strategy_engine.subscribe_symbols(self, to_subscribe)
+        self.subscribed_symbols = restored
+        if restored:
+            self.write_log(f"订阅集合已还原：{len(restored)} 只")
 
     def on_stop(self) -> None:
         """策略停止回调"""
@@ -399,6 +436,7 @@ class NearMaSurgeStrategy(StrategyTemplate):
             self.write_log(
                 f"前一交易日(trade_date={trade_date})行业“{self.industry_name}”无数据，维持现有订阅"
             )
+            self.strategy_engine.sync_strategy_data(self)
             self.put_event()
             return
 
@@ -459,6 +497,7 @@ class NearMaSurgeStrategy(StrategyTemplate):
             f"池内 {len(new_targets)} 只，"
             f"新订阅 {len(to_subscribe)} 只，退订 {len(to_unsubscribe)} 只"
         )
+        self.strategy_engine.sync_strategy_data(self)
         self.put_event()
 
     def _get_sql_engine(self) -> any:

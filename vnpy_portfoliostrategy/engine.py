@@ -438,7 +438,10 @@ class StrategyEngine(BaseEngine):
         ``strategy.vt_symbols`` 与 ``symbol_strategy_map``（行情路由依赖它，
         见 ``process_tick_event``）。已订阅的标的会跳过，避免重复订阅。
         找不到合约时写日志不抛异常，保证批量订阅不被单只异常中断。
+
+        仅在 ``inited`` 后写入 setting JSON；``on_init`` 阶段配置已读入且尚未完成初始化，不落盘。
         """
+        changed: bool = False
         for vt_symbol in vt_symbols:
             if not vt_symbol:
                 continue
@@ -464,6 +467,10 @@ class StrategyEngine(BaseEngine):
             strategies.append(strategy)
             if vt_symbol not in strategy.vt_symbols:
                 strategy.vt_symbols.append(vt_symbol)
+            changed = True
+
+        if changed and strategy.inited:
+            self.save_strategy_setting()
 
     def unsubscribe_symbols(
         self, strategy: StrategyTemplate, vt_symbols: list[str]
@@ -474,7 +481,9 @@ class StrategyEngine(BaseEngine):
         ``SubscribeRequest`` 调 ``MainEngine.unsubscribe``（按订阅者退订，
         不影响其他策略对该标的的订阅），并从 ``symbol_strategy_map`` 与
         ``strategy.vt_symbols`` 移除该项。合约不存在时仅清理本地登记。
+        仅在 ``inited`` 后写入 setting JSON。
         """
+        changed: bool = False
         for vt_symbol in vt_symbols:
             if not vt_symbol:
                 continue
@@ -495,6 +504,10 @@ class StrategyEngine(BaseEngine):
 
             if vt_symbol in strategy.vt_symbols:
                 strategy.vt_symbols.remove(vt_symbol)
+            changed = True
+
+        if changed and strategy.inited:
+            self.save_strategy_setting()
 
     def get_engine_type(self) -> EngineType:
         """获取引擎类型"""
