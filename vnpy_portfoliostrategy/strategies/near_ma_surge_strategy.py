@@ -24,7 +24,7 @@ class NearMaSurgeStrategy(StrategyTemplate):
 
     每日盘前从 SqlApp 的 ``stock_near_ma`` 表按行业名取当日成分股，订阅行情；
     退订不在当日池中且无持仓的旧标的；在无持仓标的上用 tick 实时检测「快速拉升」
-    （5 分钟内涨幅 >= surge_pct），命中即开 fixed_size 股固定仓位并持有。
+    （窗口内涨幅或相对昨收涨幅 >= surge_pct），命中即开 fixed_size 股固定仓位并持有。
 
     卖出信号（参数固定）：相对开仓价亏损超过 3% 止损；记录开仓后最大收益率，
     回撤超过 10% 卖出；最大收益 >= 10% 时最低保底 5%、>= 5% 时最低保底 2%，跌破保底即卖。
@@ -242,32 +242,44 @@ class NearMaSurgeStrategy(StrategyTemplate):
         while window and (cutoff - window[0][0]).total_seconds() > self.surge_window:
             window.popleft()
 
-        # 窗口覆盖时长不足 3 分钟时不判定，不看 tick 个数
-        if (cutoff - window[0][0]).total_seconds() < self.MIN_SURGE_SPAN:
+        # 4. 拉升判定：窗口内相对最低价涨幅 或 相对昨收涨幅 >= surge_pct（满足其一即可）
+        window_gain: float | None = None
+        if (cutoff - window[0][0]).total_seconds() >= self.MIN_SURGE_SPAN:
+            low_price: float = min(price for _, price in window if price > 0)
+            if low_price > 0:
+                window_gain = (tick.last_price - low_price) / low_price
+
+        day_gain: float | None = None
+        if tick.pre_close > 0:
+            day_gain = (tick.last_price - tick.pre_close) / tick.pre_close
+
+        gain: float | None = None
+        reason: str = ""
+        if window_gain is not None and window_gain >= self.surge_pct:
+            gain = window_gain
+            reason = "窗口"
+        elif day_gain is not None and day_gain >= self.surge_pct:
+            gain = day_gain
+            reason = "昨收"
+
+        if gain is None:
             return
 
-        ref_price: float = window[0][1]
-        if ref_price <= 0:
-            return
+        mark: str = f"{reason}涨幅 {gain * 100:.2f}% 价格 {tick.last_price} 数量 {self.fixed_size}"
+        self.buy(vt_symbol, tick.last_price + self.price_add, self.fixed_size, mark=mark)
+        self.entered.add(vt_symbol)
+        self.surge_count += 1
 
-        # 4. 拉升判定：窗口内涨幅 >= surge_pct
-        gain: float = (tick.last_price - ref_price) / ref_price
-        if gain >= self.surge_pct:
-            mark: str = f"涨幅 {gain * 100:.2f}% 价格 {tick.last_price} 数量 {self.fixed_size}"
-            self.buy(vt_symbol, tick.last_price + self.price_add, self.fixed_size, mark=mark)
-            self.entered.add(vt_symbol)
-            self.surge_count += 1
+        # 记录开仓价（用触发买入的现价近似）与初始最大收益
+        self.entry_prices[vt_symbol] = tick.last_price
+        self.max_profit_pct[vt_symbol] = 0.0
+        self._sync_tracking_state()
 
-            # 记录开仓价（用触发买入的现价近似）与初始最大收益
-            self.entry_prices[vt_symbol] = tick.last_price
-            self.max_profit_pct[vt_symbol] = 0.0
-            self._sync_tracking_state()
-
-            name: str = self.target_symbols.get(vt_symbol, "")
-            msg: str = f"快速拉升买入 {vt_symbol}({name}) {mark}"
-            self.write_log(msg)
-            self.send_wecom(msg)
-            self.put_event()
+        name: str = self.target_symbols.get(vt_symbol, "")
+        msg: str = f"快速拉升买入 {vt_symbol}({name}) {mark}"
+        self.write_log(msg)
+        self.send_wecom(msg)
+        self.put_event()
 
     def on_bars(self, bars: dict[str, BarData]) -> None:
         """K线切片回调（本策略拉升检测走 tick，此处留空）"""
