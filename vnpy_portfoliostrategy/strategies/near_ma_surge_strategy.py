@@ -26,8 +26,9 @@ class NearMaSurgeStrategy(StrategyTemplate):
     退订不在当日池中且无持仓的旧标的；在无持仓标的上用 tick 实时检测「快速拉升」
     （窗口内涨幅或相对昨收涨幅 >= surge_pct），命中即开 fixed_size 股固定仓位并持有。
 
-    卖出信号（参数固定）：相对开仓价亏损超过 3% 止损；记录开仓后最大收益率，
-    回撤超过 10% 卖出；最大收益 >= 10% 时最低保底 5%、>= 5% 时最低保底 2%，跌破保底即卖。
+    卖出信号（参数固定）：相对开仓价亏损超过 2% 止损；记录开仓后最大收益率，
+    回撤超过 10% 卖出；最大收益 >= 10% 时最低保底 5%、>= 5% 时最低保底 2%、
+    >= 3% 时不能赔钱（跌破成本即卖）。
     """
 
     author: str = "用Python的交易员"
@@ -51,12 +52,14 @@ class NearMaSurgeStrategy(StrategyTemplate):
     REFRESH_TIME: time = time(9, 15)
 
     # 止损 / 移动止盈参数（固定，不暴露为策略参数）
-    STOP_LOSS_PCT: float = 0.03          # 固定止损：相对开仓价亏损 3% 即卖
+    STOP_LOSS_PCT: float = 0.02          # 固定止损：相对开仓价亏损 2% 即卖
     MAX_DRAWDOWN_PCT: float = 0.10       # 最大回撤上限：相对最大收益回撤 10% 即卖
     TIER_HIGH_PCT: float = 0.10          # 最大收益 >= 10% 时，最低保底 5%
     TIER_HIGH_FLOOR: float = 0.05
     TIER_LOW_PCT: float = 0.05           # 最大收益 >= 5% 时，最低保底 2%
     TIER_LOW_FLOOR: float = 0.02
+    TIER_BREAKEVEN_PCT: float = 0.03     # 最大收益 >= 3% 时，不能赔钱（保底 0%）
+    TIER_BREAKEVEN_FLOOR: float = 0.0
 
     parameters: list = [
         "industry_name",
@@ -214,14 +217,14 @@ class NearMaSurgeStrategy(StrategyTemplate):
         vt_symbol: str = tick.vt_symbol
         pos: int = self.get_pos(vt_symbol)
 
-        # 2. 有持仓走卖出分支（止损 / 移动止盈；T+1 可卖量由基类 get_sellable 处理）
+        # 2. 有持仓且可卖量 > 0 才走卖出分支（止损 / 移动止盈）
         if pos > 0:
-            if vt_symbol not in self.max_profit_pct:
-                self._init_max_profit_from_tick(vt_symbol, tick)
-            sell_msg: str = self.check_sell_signal(vt_symbol, tick)
-            if sell_msg:
-                sellable: int = self.get_sellable(vt_symbol)
-                if sellable > 0:
+            sellable: int = self.get_sellable(vt_symbol)
+            if sellable > 0:
+                if vt_symbol not in self.max_profit_pct:
+                    self._init_max_profit_from_tick(vt_symbol, tick)
+                sell_msg: str = self.check_sell_signal(vt_symbol, tick)
+                if sell_msg:
                     self.sell(vt_symbol, tick.last_price - self.price_add, sellable, mark=sell_msg)
                     self.send_wecom(sell_msg)
             return
@@ -343,12 +346,13 @@ class NearMaSurgeStrategy(StrategyTemplate):
         """卖出信号判定：固定止损 + 移动止盈
 
         规则（参数固定，不可配置）：
-        1. 相对开仓价亏损 >= STOP_LOSS_PCT(3%) → 止损卖出；
+        1. 相对开仓价亏损 >= STOP_LOSS_PCT(2%) → 止损卖出；
         2. 记录开仓后最大收益率 ``max_profit``；
         3. 当前收益相对最大收益回撤 >= MAX_DRAWDOWN_PCT(10%) → 卖出；
-        4. 保底收益线（取两者较大者生效）：
+        4. 保底收益线（取最高适用档）：
            - 最大收益 >= 10% → 最低保证 5%；
            - 最大收益 >= 5%  → 最低保证 2%；
+           - 最大收益 >= 3%  → 不能赔钱（保底 0%）；
            当前收益跌破保底线 → 卖出。
 
         命中则返回卖出说明字符串，否则返回空串。
@@ -382,13 +386,15 @@ class NearMaSurgeStrategy(StrategyTemplate):
             )
 
         # 3) 保底收益线
-        floor: float = 0.0
+        floor: float | None = None
         if max_profit >= self.TIER_HIGH_PCT:
             floor = self.TIER_HIGH_FLOOR
         elif max_profit >= self.TIER_LOW_PCT:
             floor = self.TIER_LOW_FLOOR
+        elif max_profit >= self.TIER_BREAKEVEN_PCT:
+            floor = self.TIER_BREAKEVEN_FLOOR
 
-        if floor > 0 and profit_pct < floor:
+        if floor is not None and profit_pct < floor:
             return self._log_sell(
                 vt_symbol, tick, profit_pct, max_profit,
                 f"跌破保底 {floor * 100:.0f}%",
