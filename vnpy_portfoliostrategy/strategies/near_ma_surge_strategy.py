@@ -23,6 +23,7 @@ class NearMaSurgeStrategy(StrategyTemplate):
     """Near-Ma 快速拉升策略
 
     每日盘前从 SqlApp 的 ``stock_near_ma`` 表按行业名取当日成分股，订阅行情；
+    09:15 刷新标的池，09:30 连续竞价开始后才开始买卖判定与拉升检测；
     退订不在当日池中且无持仓的旧标的；在无持仓标的上用 tick 实时检测「快速拉升」
     （窗口内涨幅或相对昨收涨幅 >= surge_pct），命中即开 fixed_size 股固定仓位并持有。
 
@@ -50,6 +51,8 @@ class NearMaSurgeStrategy(StrategyTemplate):
 
     # 每日盘前刷新订阅标的池的固定时刻（09:15）
     REFRESH_TIME: time = time(9, 15)
+    # 连续竞价开始时刻（09:30）；此前为集合竞价，波动大，不做买卖判定
+    MARKET_OPEN_TIME: time = time(9, 30)
 
     # 止损 / 移动止盈参数（固定，不暴露为策略参数）
     STOP_LOSS_PCT: float = 0.02          # 固定止损：相对开仓价亏损 2% 即卖
@@ -206,6 +209,13 @@ class NearMaSurgeStrategy(StrategyTemplate):
         self.max_profit_pct[vt_symbol] = profit_pct
         self._sync_tracking_state()
 
+    def _is_trading_session(self, tick: TickData) -> bool:
+        """是否处于连续竞价时段（09:30 起）
+
+        09:15~09:30 为集合竞价，价格波动大且不可连续成交，跳过买卖与窗口采样。
+        """
+        return tick.datetime.time() >= self.MARKET_OPEN_TIME
+
     def on_tick(self, tick: TickData) -> None:
         """行情推送回调：日切刷新 + 拉升检测 + 买入/卖出"""
         # 1. 日切刷新：日期变更且到盘前刷新时刻（09:15），重新拉取当日池
@@ -213,6 +223,10 @@ class NearMaSurgeStrategy(StrategyTemplate):
         if tick_date != self.last_refresh_date:
             if tick.datetime.time() >= self.REFRESH_TIME:
                 self.refresh_universe()
+
+        # 集合竞价时段仅刷新标的池，不做买卖判定与窗口采样
+        if not self._is_trading_session(tick):
+            return
 
         vt_symbol: str = tick.vt_symbol
         pos: int = self.get_pos(vt_symbol)
