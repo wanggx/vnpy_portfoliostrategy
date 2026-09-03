@@ -4,7 +4,7 @@ from datetime import datetime, time, timedelta
 from vnpy.trader.constant import Exchange, Direction, Status
 from vnpy.trader.object import TickData, BarData, TradeData, OrderData
 
-from xtquant import xtdata
+from bigqmt_signal_trader.xtquant_compat import xtdata
 
 from vnpy_sqlapp import APP_NAME as SQLAPP_NAME
 
@@ -438,7 +438,7 @@ class NearMaSurgeStrategy(StrategyTemplate):
         """每日刷新标的池：按前一交易日查库取当日成分 → 订阅新标的 → 退订不在池中且无持仓的旧标的
 
         DB 数据按前一交易日生成（screening 基于前一交易日收盘价），因此取数日期
-        取前一交易日（由 xtquant 交易日历给出，自动跨越周末/节假日）。
+        取前一交易日（由大 QMT 交易日历给出，自动跨越周末/节假日）。
         若前一交易日查不到数据，不做任何订阅/退订处理，维持昨天的订阅数据（现有订阅保持不变）。
         """
         sql_engine = self._get_sql_engine()
@@ -542,29 +542,49 @@ class NearMaSurgeStrategy(StrategyTemplate):
     def _previous_trade_date(self) -> str:
         """前一交易日（严格小于今天的最大交易日，A 股自动跨越周末/节假日）
 
-        优先用 xtquant 交易日历（``xtdata.get_trading_dates``，市场取 SH）；
-        若 xtdata 未连接或取数失败，回退为按自然日往回跳过周末的近似值并写日志。
+        经大 QMT RPC 桥 ``xtdata.get_trading_dates`` 取 SH 日历。
+        RPC 失败时回退为跳过周末的近似值。
         """
         today: datetime = datetime.now()
         today_str: str = today.strftime("%Y%m%d")
         try:
             # 往前看 15 天，足够跨越周末和长假（春节/国庆最长 7 天）
             start: str = (today - timedelta(days=15)).strftime("%Y%m%d")
-            dates = xtdata.get_trading_dates("SH", start_time=start, end_time=today_str, count=-1)
+            dates = xtdata.get_trading_dates(
+                "SH", start_time=start, end_time=today_str, count=-1
+            )
             trade_days: list[str] = [
-                datetime.fromtimestamp(ts / 1000).strftime("%Y%m%d") for ts in dates
+                day for day in (self._as_yyyymmdd(item) for item in (dates or []))
+                if day
             ]
             prev_days: list[str] = [d for d in trade_days if d < today_str]
             if prev_days:
                 return max(prev_days)
-            self.write_log("xtquant 未返回小于今天的交易日，回退近似前一交易日")
+            self.write_log("交易日历未返回小于今天的交易日，回退近似前一交易日")
         except Exception as exc:  # noqa: BLE001 - 回退近似值，不影响策略运行
-            self.write_log(f"xtquant 取前一交易日失败，回退近似：{exc}")
+            self.write_log(f"交易日历取前一交易日失败，回退近似：{exc}")
         # 回退：往回跳过周末（不考虑节假日）
         d: datetime = today - timedelta(days=1)
         while d.weekday() >= 5:  # 5=周六, 6=周日
             d -= timedelta(days=1)
         return d.strftime("%Y%m%d")
+
+    @staticmethod
+    def _as_yyyymmdd(value) -> str:
+        """兼容 MiniQMT 毫秒时间戳和大 QMT 的 YYYYMMDD 字符串。"""
+        if isinstance(value, datetime):
+            return value.strftime("%Y%m%d")
+        if isinstance(value, str):
+            digits: str = "".join(ch for ch in value if ch.isdigit())
+            return digits[:8] if len(digits) >= 8 else ""
+        number: int = int(value)
+        if number >= 10**12:
+            return datetime.fromtimestamp(number / 1000.0).strftime("%Y%m%d")
+        if number >= 10**9:
+            return datetime.fromtimestamp(float(number)).strftime("%Y%m%d")
+        if 19_000_000 <= number <= 21_000_000:
+            return f"{number:08d}"
+        return ""
 
     @staticmethod
     def _code_to_vt_symbol(code: str) -> str:
