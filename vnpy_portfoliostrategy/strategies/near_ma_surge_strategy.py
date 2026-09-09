@@ -74,6 +74,7 @@ class NearMaSurgeStrategy(StrategyTemplate):
 
     variables: list = [
         "target_symbols",
+        "symbol_names",
         "last_refresh_date",
         "surge_count",
         "entry_prices",
@@ -94,6 +95,9 @@ class NearMaSurgeStrategy(StrategyTemplate):
         self.subscribed_symbols: set[str] = set(vt_symbols)
         # 当日标的池：vt_symbol -> name（用于日志展示）
         self.target_symbols: dict[str, str] = {}
+        # 标的名称累积表：vt_symbol -> name，跨日持久化，仅增不删
+        # 用于消息推送时查 name，避免持仓标的跌出当日池后 name 丢失
+        self.symbol_names: dict[str, str] = {}
         # 当日标的池全行数据：vt_symbol -> row(dict)，保留库表所有列
         self.universe_data: dict[str, dict] = {}
         # 最近一次刷新日期（YYYYMMDD），用于日切判断
@@ -292,7 +296,7 @@ class NearMaSurgeStrategy(StrategyTemplate):
         self.max_profit_pct[vt_symbol] = 0.0
         self._sync_tracking_state()
 
-        name: str = self.target_symbols.get(vt_symbol, "")
+        name: str = self.symbol_names.get(vt_symbol, "")
         msg: str = f"快速拉升买入 {vt_symbol}({name}) {mark}"
         self.write_log(msg)
         self.send_wecom(msg)
@@ -329,7 +333,7 @@ class NearMaSurgeStrategy(StrategyTemplate):
         if tracking_changed:
             self._sync_tracking_state()
 
-        name: str = self.target_symbols.get(vt_symbol, "")
+        name: str = self.symbol_names.get(vt_symbol, "")
         direction: str = trade.direction.value if trade.direction else ""
         offset: str = trade.offset.value if trade.offset else ""
         self.send_wecom(
@@ -347,7 +351,7 @@ class NearMaSurgeStrategy(StrategyTemplate):
             Status.CANCELLED, Status.REJECTED
         }:
             return
-        name: str = self.target_symbols.get(order.vt_symbol, "")
+        name: str = self.symbol_names.get(order.vt_symbol, "")
         direction: str = order.direction.value if order.direction else ""
         offset: str = order.offset.value if order.offset else ""
         status: str = order.status.value if order.status else ""
@@ -425,7 +429,7 @@ class NearMaSurgeStrategy(StrategyTemplate):
         reason: str,
     ) -> str:
         """记录卖出信号日志，并返回同一条说明供 mark / 企微复用"""
-        name: str = self.target_symbols.get(vt_symbol, "")
+        name: str = self.symbol_names.get(vt_symbol, "")
         msg: str = (
             f"卖出信号 {vt_symbol}({name}) {reason} "
             f"现价 {tick.last_price} 当前收益 {profit_pct * 100:.2f}% "
@@ -519,6 +523,8 @@ class NearMaSurgeStrategy(StrategyTemplate):
         # 退订的从已订阅集合移除
         self.subscribed_symbols -= set(to_unsubscribe)
         self.target_symbols = new_targets
+        # 累积 name：只增不覆盖当日池外持仓标的的 name，保证跨日持仓消息有名称
+        self.symbol_names.update(new_targets)
         self.universe_data = new_universe
 
         # 动态标的池变化后重新读取经纪商持仓，确保每个标的独立完成 T+1 同步。
