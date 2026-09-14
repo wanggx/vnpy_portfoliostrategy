@@ -10,6 +10,7 @@ from bigqmt_signal_trader.xtquant_compat import xtdata
 from vnpy_sqlapp import APP_NAME as SQLAPP_NAME
 
 from vnpy_portfoliostrategy import StrategyTemplate, StrategyEngine
+from vnpy_portfoliostrategy.signals import SectorBuySignal
 
 
 # xtquant 代码后缀 -> vnpy 交易所映射
@@ -133,6 +134,8 @@ class NearMaSurgeStrategy(StrategyTemplate):
         """
         self.write_log("策略初始化")
         self._restore_subscribed_symbols()
+        # 行业情绪买入信号器：买入前判断所属行业评级是否中性以上
+        self.sector_signal: SectorBuySignal = SectorBuySignal(self)
         self.load_bars(1)
 
     def on_start(self) -> None:
@@ -243,6 +246,9 @@ class NearMaSurgeStrategy(StrategyTemplate):
         if not self._is_trading_session(tick):
             return
 
+        # 转发 tick 给行业情绪信号器（缓存当前标的与行情，供后续扩展）
+        self.sector_signal.on_tick(tick)
+
         vt_symbol: str = tick.vt_symbol
         pos: int = self.get_pos(vt_symbol)
 
@@ -297,6 +303,22 @@ class NearMaSurgeStrategy(StrategyTemplate):
         if gain is None:
             return
 
+        # 5. 行业情绪过滤：所属行业评级须在中性以上才允许买入
+        sector_result = self.sector_signal.is_buyable(vt_symbol)
+        name: str = self.symbol_names.get(vt_symbol, "")
+        if not sector_result.buyable:
+            skip_msg: str = (
+                f"行业情绪拦截 {vt_symbol}({name}) "
+                f"行业 {sector_result.sector_name} 得分 {sector_result.sector_score:.1f} "
+                f"评级 {sector_result.sector_level}，未达中性以上，不买入"
+            )
+            self.write_log(skip_msg)
+            self.send_wecom(skip_msg)
+            # 标记本轮已处理，避免同一波拉升反复拦截刷屏
+            self.entered.add(vt_symbol)
+            self.put_event()
+            return
+
         mark: str = f"{reason}涨幅 {gain * 100:.2f}% 价格 {tick.last_price} 数量 {self.fixed_size}"
         self.buy(vt_symbol, tick.last_price + self.price_add, self.fixed_size, mark=mark)
         self.entered.add(vt_symbol)
@@ -307,8 +329,11 @@ class NearMaSurgeStrategy(StrategyTemplate):
         self.max_profit_pct[vt_symbol] = 0.0
         self._sync_tracking_state()
 
-        name: str = self.symbol_names.get(vt_symbol, "")
-        msg: str = f"快速拉升买入 {vt_symbol}({name}) {mark}"
+        msg: str = (
+            f"快速拉升买入 {vt_symbol}({name}) {mark} "
+            f"行业 {sector_result.sector_name} 得分 {sector_result.sector_score:.1f} "
+            f"评级 {sector_result.sector_level}"
+        )
         self.write_log(msg)
         self.send_wecom(msg)
         self.put_event()
