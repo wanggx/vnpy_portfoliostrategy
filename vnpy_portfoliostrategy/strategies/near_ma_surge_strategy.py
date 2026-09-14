@@ -1,3 +1,4 @@
+import math
 from collections import deque
 from datetime import datetime, time, timedelta
 
@@ -27,9 +28,10 @@ class NearMaSurgeStrategy(StrategyTemplate):
     退订不在当日池中且无持仓的旧标的；在无持仓标的上用 tick 实时检测「快速拉升」
     （窗口内涨幅或相对昨收涨幅 >= surge_pct），命中即开 fixed_size 股固定仓位并持有。
 
-    卖出信号（参数固定）：相对开仓价亏损超过 2% 止损；记录开仓后最大收益率，
-    回撤超过 10% 卖出；最大收益 >= 10% 时最低保底 5%、>= 5% 时最低保底 2%、
-    >= 3% 时不能赔钱（跌破成本即卖）。
+    卖出信号：相对开仓价亏损超过 2% 止损；收益达 clear_profit_pct(默认 20%)
+    清仓、达 half_profit_pct(默认 10%) 仓位减半（每标的仅减半一次）；记录开仓后
+    最大收益率，回撤超过 10% 卖出；最大收益 >= 10% 时最低保底 5%、>= 5% 时最低
+    保底 2%、>= 3% 时不能赔钱（跌破成本即卖）。
     """
 
     author: str = "用Python的交易员"
@@ -64,12 +66,18 @@ class NearMaSurgeStrategy(StrategyTemplate):
     TIER_BREAKEVEN_PCT: float = 0.03     # 最大收益 >= 3% 时，不能赔钱（保底 0%）
     TIER_BREAKEVEN_FLOOR: float = 0.0
 
+    # 分档止盈参数（可配置）：收益达 half_profit_pct 仓位减半，达 clear_profit_pct 清仓
+    half_profit_pct: float = 0.10        # 收益率达此值时仓位减半（默认 10%）
+    clear_profit_pct: float = 0.20       # 收益率达此值时清仓（默认 20%）
+
     parameters: list = [
         "industry_name",
         "fixed_size",
         "price_add",
         "surge_pct",
         "surge_window",
+        "half_profit_pct",
+        "clear_profit_pct",
     ]
 
     variables: list = [
@@ -113,6 +121,8 @@ class NearMaSurgeStrategy(StrategyTemplate):
         # 持仓追踪：开仓价与开仓后最大收益率，用于移动止盈
         self.entry_prices: dict[str, float] = {}
         self.max_profit_pct: dict[str, float] = {}
+        # 减半标记：记录已触发减半的标的，避免同一标的多于一次减半（清仓后清理）
+        self.halved: set[str] = set()
 
     def on_init(self) -> None:
         """策略初始化回调
@@ -192,6 +202,7 @@ class NearMaSurgeStrategy(StrategyTemplate):
                 self.max_profit_pct.pop(vt_symbol, None)
                 self._sync_tracking_state()
             self.entered.discard(vt_symbol)
+            self.halved.discard(vt_symbol)
 
     def _sync_tracking_state(self) -> None:
         """持久化 entry_prices / max_profit_pct 到 portfolio_strategy_data.json"""
@@ -235,15 +246,15 @@ class NearMaSurgeStrategy(StrategyTemplate):
         vt_symbol: str = tick.vt_symbol
         pos: int = self.get_pos(vt_symbol)
 
-        # 2. 有持仓且可卖量 > 0 才走卖出分支（止损 / 移动止盈）
+        # 2. 有持仓且可卖量 > 0 才走卖出分支（止损 / 移动止盈 / 分档止盈）
         if pos > 0:
             sellable: int = self.get_sellable(vt_symbol)
             if sellable > 0:
                 if vt_symbol not in self.max_profit_pct:
                     self._init_max_profit_from_tick(vt_symbol, tick)
-                sell_msg: str = self.check_sell_signal(vt_symbol, tick)
-                if sell_msg:
-                    self.sell(vt_symbol, tick.last_price - self.price_add, sellable, mark=sell_msg)
+                sell_msg, sell_vol = self.check_sell_signal(vt_symbol, tick)
+                if sell_msg and sell_vol > 0:
+                    self.sell(vt_symbol, tick.last_price - self.price_add, sell_vol, mark=sell_msg)
                     self.send_wecom(sell_msg)
             return
 
@@ -329,6 +340,7 @@ class NearMaSurgeStrategy(StrategyTemplate):
                     self.max_profit_pct.pop(vt_symbol, None)
                     tracking_changed = True
                 self.entered.discard(vt_symbol)
+                self.halved.discard(vt_symbol)
 
         if tracking_changed:
             self._sync_tracking_state()
@@ -360,26 +372,29 @@ class NearMaSurgeStrategy(StrategyTemplate):
             f"开平 {offset} 价格 {order.price:.2f} 委托 {order.volume} 成交 {order.traded}"
         )
 
-    def check_sell_signal(self, vt_symbol: str, tick: TickData) -> str:
-        """卖出信号判定：固定止损 + 移动止盈
+    def check_sell_signal(self, vt_symbol: str, tick: TickData) -> tuple[str, int]:
+        """卖出信号判定：固定止损 + 分档止盈 + 移动止盈
 
-        规则（参数固定，不可配置）：
-        1. 相对开仓价亏损 >= STOP_LOSS_PCT(2%) → 止损卖出；
-        2. 记录开仓后最大收益率 ``max_profit``；
-        3. 当前收益相对最大收益回撤 >= MAX_DRAWDOWN_PCT(10%) → 卖出；
-        4. 保底收益线（取最高适用档）：
+        返回 ``(卖出说明, 卖出数量)``；说明为空串且数量为 0 表示不卖。
+
+        规则（按优先级）：
+        1. 相对开仓价亏损 >= STOP_LOSS_PCT(2%) → 止损全清；
+        2. 收益 >= clear_profit_pct(默认 20%) → 清仓全清；
+        3. 收益 >= half_profit_pct(默认 10%) 且尚未减半 → 减半卖出（每标的仅触发一次）；
+        4. 记录开仓后最大收益率 ``max_profit``；
+        5. 当前收益相对最大收益回撤 >= MAX_DRAWDOWN_PCT(10%) → 全清；
+        6. 保底收益线（取最高适用档）：
            - 最大收益 >= 10% → 最低保证 5%；
            - 最大收益 >= 5%  → 最低保证 2%；
            - 最大收益 >= 3%  → 不能赔钱（保底 0%）；
-           当前收益跌破保底线 → 卖出。
-
-        命中则返回卖出说明字符串，否则返回空串。
+           当前收益跌破保底线 → 全清。
         """
         entry_price: float | None = self.entry_prices.get(vt_symbol, None)
         if not entry_price or entry_price <= 0 or not tick.last_price:
-            return ""
+            return "", 0
 
         profit_pct: float = (tick.last_price - entry_price) / entry_price
+        sellable: int = self.get_sellable(vt_symbol)
 
         # 更新历史最大收益率
         max_profit: float = self.max_profit_pct.get(vt_symbol, 0.0)
@@ -390,20 +405,42 @@ class NearMaSurgeStrategy(StrategyTemplate):
 
         # 1) 固定止损：相对开仓价亏损超 STOP_LOSS_PCT
         if profit_pct <= -self.STOP_LOSS_PCT:
-            return self._log_sell(
+            msg = self._log_sell(
                 vt_symbol, tick, profit_pct, max_profit,
                 f"止损 亏损 {abs(profit_pct) * 100:.2f}% 超过 {self.STOP_LOSS_PCT * 100:.0f}%",
             )
+            return msg, sellable
 
-        # 2) 回撤止盈：相对最大收益回撤超 MAX_DRAWDOWN_PCT
+        # 2) 清仓止盈：收益达 clear_profit_pct
+        if profit_pct >= self.clear_profit_pct:
+            msg = self._log_sell(
+                vt_symbol, tick, profit_pct, max_profit,
+                f"清仓 收益 {profit_pct * 100:.2f}% 达到 {self.clear_profit_pct * 100:.0f}%",
+            )
+            return msg, sellable
+
+        # 3) 减半止盈：收益达 half_profit_pct 且未减半（每标的仅触发一次）
+        #    卖出量按 100 股向上取整；若取整后 >= 全部可卖量则跳过（避免等于清仓）
+        if profit_pct >= self.half_profit_pct and vt_symbol not in self.halved:
+            half_vol: int = math.ceil(sellable / 2 / 100) * 100
+            if 0 < half_vol < sellable:
+                self.halved.add(vt_symbol)
+                msg = self._log_sell(
+                    vt_symbol, tick, profit_pct, max_profit,
+                    f"减半 收益 {profit_pct * 100:.2f}% 达到 {self.half_profit_pct * 100:.0f}% 卖 {half_vol}",
+                )
+                return msg, half_vol
+
+        # 4) 回撤止盈：相对最大收益回撤超 MAX_DRAWDOWN_PCT
         drawdown: float = max_profit - profit_pct
         if drawdown >= self.MAX_DRAWDOWN_PCT:
-            return self._log_sell(
+            msg = self._log_sell(
                 vt_symbol, tick, profit_pct, max_profit,
                 f"回撤 {drawdown * 100:.2f}% 超过 {self.MAX_DRAWDOWN_PCT * 100:.0f}%",
             )
+            return msg, sellable
 
-        # 3) 保底收益线
+        # 5) 保底收益线
         floor: float | None = None
         if max_profit >= self.TIER_HIGH_PCT:
             floor = self.TIER_HIGH_FLOOR
@@ -413,12 +450,13 @@ class NearMaSurgeStrategy(StrategyTemplate):
             floor = self.TIER_BREAKEVEN_FLOOR
 
         if floor is not None and profit_pct < floor:
-            return self._log_sell(
+            msg = self._log_sell(
                 vt_symbol, tick, profit_pct, max_profit,
                 f"跌破保底 {floor * 100:.0f}%",
             )
+            return msg, sellable
 
-        return ""
+        return "", 0
 
     def _log_sell(
         self,
