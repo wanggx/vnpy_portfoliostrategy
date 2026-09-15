@@ -315,8 +315,10 @@ class NearMaSurgeStrategy(StrategyTemplate):
         sector_result = self.sector_signal.is_buyable(vt_symbol)
         name: str = self._get_symbol_name(vt_symbol)
         if not sector_result.buyable:
+            buy_price: float = tick.last_price + self.price_add
             skip_msg: str = (
                 f"行业情绪拦截 {vt_symbol}({name}) "
+                f"买入价格 {buy_price:.2f} "
                 f"行业 {sector_result.sector_name} 得分 {sector_result.sector_score:.1f} "
                 f"评级 {sector_result.sector_level}，未达中性以上，不买入"
             )
@@ -327,8 +329,9 @@ class NearMaSurgeStrategy(StrategyTemplate):
             self.put_event()
             return
 
-        mark: str = f"{reason}涨幅 {gain * 100:.2f}% 价格 {tick.last_price} 数量 {self.fixed_size}"
-        self.buy(vt_symbol, tick.last_price + self.price_add, self.fixed_size, mark=mark)
+        buy_price: float = tick.last_price + self.price_add
+        mark: str = f"{reason}涨幅 {gain * 100:.2f}% 买入价格 {buy_price:.2f} 数量 {self.fixed_size}"
+        self.buy(vt_symbol, buy_price, self.fixed_size, mark=mark)
         self.entered.add(vt_symbol)
         self.surge_count += 1
 
@@ -501,9 +504,10 @@ class NearMaSurgeStrategy(StrategyTemplate):
     ) -> str:
         """记录卖出信号日志，并返回同一条说明供 mark / 企微复用"""
         name: str = self._get_symbol_name(vt_symbol)
+        sell_price: float = tick.last_price - self.price_add
         msg: str = (
             f"卖出信号 {vt_symbol}({name}) {reason} "
-            f"现价 {tick.last_price} 当前收益 {profit_pct * 100:.2f}% "
+            f"卖出价格 {sell_price:.2f} 当前收益 {profit_pct * 100:.2f}% "
             f"最大收益 {max_profit * 100:.2f}%"
         )
         self.write_log(msg)
