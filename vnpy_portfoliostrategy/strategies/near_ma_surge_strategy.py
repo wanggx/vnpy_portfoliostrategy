@@ -73,7 +73,9 @@ class NearMaSurgeStrategy(StrategyTemplate):
     TIER_HIGH_FLOOR: float = 0.05
     TIER_LOW_PCT: float = 0.05           # 最大收益 >= 5% 时，最低保底 2%
     TIER_LOW_FLOOR: float = 0.02
-    TIER_BREAKEVEN_PCT: float = 0.03     # 最大收益 >= 3% 时，不能赔钱（保底 0%）
+    # 最大收益 >= 3% 时，不能赔钱（保底 0%）
+    # 亦作情绪卖出阈值：当前收益低于此值且行业评级中性以下时，在还有收益时及时离场
+    TIER_BREAKEVEN_PCT: float = 0.03
     TIER_BREAKEVEN_FLOOR: float = 0.0
 
     # 分档止盈参数（可配置）：收益达 half_profit_pct 仓位减半，达 clear_profit_pct 清仓

@@ -3,8 +3,9 @@
 卖出总信号 ``SellAggregator`` 内部聚合一个优先级组合子信号 ``SellSubSignal``，
 其按优先级短路运行两条独立子信号：
 
-1. ``SectorSellSubSignal``（优先）：情绪卖出。收益低于 ``TIER_BREAKEVEN_PCT`` 且所属
-   行业评级在中性以下（偏弱/极弱）→ 全清；降级（不可用/未分行业/未映射）不触发。
+1. ``SectorSellSubSignal``（优先）：情绪卖出。还有收益但低于 ``TIER_BREAKEVEN_PCT``
+   （``0 <= profit < TIER_BREAKEVEN_PCT``）且所属行业评级在中性以下（偏弱/极弱）→ 全清；
+   亏损交给价格止损，避免抢先绕过 2% 止损线。降级（不可用/未分行业/未映射）不触发。
    命中即短路，价格卖出不跑。
 2. ``PriceSellSubSignal``（其次）：价格卖出。相对开仓价亏损 2% 止损、收益达
    clear_profit_pct 清仓、达 half_profit_pct 仓位减半（每标的仅一次）、回撤超
@@ -33,12 +34,13 @@ if TYPE_CHECKING:
 
 
 class SectorSellSubSignal(SubSignal):
-    """单标的情绪卖出子信号（优先）：收益低于阈值且行业偏弱 → 全清。
+    """单标的情绪卖出子信号（优先）：还有收益但低于阈值且行业偏弱 → 全清。
 
-    ``on_tick`` 算 profit_pct，收益低于 ``TIER_BREAKEVEN_PCT`` 且自持 ``SectorSellSignal``
-    判定行业评级偏弱/极弱（``sellable``）时产出 CLEAR；否则 NONE（交价格卖出）。
-    降级（不可用/未分行业）``sellable`` 为 False，不触发。``prev`` 忽略（优先级组合内
-    的独立判定支）。
+    ``on_tick`` 算 profit_pct，仅在 ``0 <= profit_pct < TIER_BREAKEVEN_PCT``（有收益但
+    低于保底阈值）且自持 ``SectorSellSignal`` 判定行业评级偏弱/极弱（``sellable``）时产出
+    CLEAR；亏损（profit < 0）交给价格止损处理，避免抢先绕过 2% 止损线。其余 NONE
+    （交价格卖出）。降级（不可用/未分行业）``sellable`` 为 False，不触发。``prev`` 忽略
+    （优先级组合内的独立判定支）。
     """
 
     def __init__(self, vt_symbol: str, strategy: StrategyTemplate) -> None:
@@ -59,8 +61,9 @@ class SectorSellSubSignal(SubSignal):
         profit_pct: float = (tick.last_price - entry_price) / entry_price
         sellable: int = s.get_sellable(self.vt_symbol)
 
-        # 收益不低于保底阈值，不触发情绪卖出
-        if profit_pct >= s.TIER_BREAKEVEN_PCT:
+        # 情绪卖出仅在"还有收益但低于保底阈值"时触发（0 <= profit < TIER_BREAKEVEN_PCT）；
+        # 亏损时交给价格止损处理，避免情绪卖出抢先绕过 2% 止损线
+        if profit_pct < 0 or profit_pct >= s.TIER_BREAKEVEN_PCT:
             self._result = SignalResult()
             return self._result
 
