@@ -1,5 +1,3 @@
-import math
-from collections import deque
 from datetime import datetime, time, timedelta
 
 from vnpy.trader.constant import Exchange, Direction, Status
@@ -10,7 +8,12 @@ from bigqmt_signal_trader.xtquant_compat import xtdata
 from vnpy_sqlapp import APP_NAME as SQLAPP_NAME
 
 from vnpy_portfoliostrategy import StrategyTemplate, StrategyEngine
-from vnpy_portfoliostrategy.signals import SectorBuySignal
+from vnpy_portfoliostrategy.signals import (
+    SignalResult,
+    SignalType,
+    SellAggregator,
+    BuyAggregator,
+)
 
 
 # xtquant 代码后缀 -> vnpy 交易所映射
@@ -29,10 +32,16 @@ class NearMaSurgeStrategy(StrategyTemplate):
     退订不在当日池中且无持仓的旧标的；在无持仓标的上用 tick 实时检测「快速拉升」
     （窗口内涨幅或相对昨收涨幅 >= surge_pct），命中即开 fixed_size 股固定仓位并持有。
 
-    卖出信号：相对开仓价亏损超过 2% 止损；收益达 clear_profit_pct(默认 20%)
-    清仓、达 half_profit_pct(默认 10%) 仓位减半（每标的仅减半一次）；记录开仓后
-    最大收益率，回撤超过 10% 卖出；最大收益 >= 10% 时最低保底 5%、>= 5% 时最低
-    保底 2%、>= 3% 时不能赔钱（跌破成本即卖）。
+    卖出信号由两类信号器组合，情绪卖出优先：行业情绪卖出信号在收益低于 3% 且
+    所属行业评级转为中性以下（偏弱/极弱）时主动离场全清；价格卖出信号负责相对
+    开仓价亏损 2% 止损、收益达 clear_profit_pct(默认 20%) 清仓、达
+    half_profit_pct(默认 10%) 仓位减半（每标的仅减半一次）、回撤超过 10% 卖出，
+    以及最大收益 >= 10% 保底 5%、>= 5% 保底 2%、>= 3% 不赔钱的保底收益线。
+
+    信号架构分两层：买入/卖出各一个总信号（``BuyAggregator`` / ``SellAggregator``），
+    内部按 ``vt_symbol`` 维护子信号映射并分发行情；子信号经 ``signal_result()`` 返回
+    ``SignalResult``（type=买入/卖出/清仓 + 数量 + 价格 + 原因），策略据此下单。
+    需持久化的全局状态（开仓价/最大收益/标的池等）仍由策略持有，子信号经引用访问。
     """
 
     author: str = "用Python的交易员"
@@ -110,9 +119,7 @@ class NearMaSurgeStrategy(StrategyTemplate):
         # 累计触发拉升买入次数
         self.surge_count: int = 0
 
-        # 每标的价格窗口：vt_symbol -> deque[(datetime, price)]，仅保留窗口内样本
-        self.price_windows: dict[str, deque] = {}
-        # 本轮已触发买入的标的，避免同一波拉升重复下单
+        # 本轮已触发买入的标的，避免同一波拉升重复下单（含行业拦截也标记）
         self.entered: set[str] = set()
 
         # 持仓追踪：开仓价与开仓后最大收益率，用于移动止盈
@@ -130,8 +137,10 @@ class NearMaSurgeStrategy(StrategyTemplate):
         """
         self.write_log("策略初始化")
         self._restore_subscribed_symbols()
-        # 行业情绪买入信号器：买入前判断所属行业评级是否中性以上
-        self.sector_signal: SectorBuySignal = SectorBuySignal(self)
+        # 买入总信号：按 vt_symbol 聚合拉升 + 行业过滤子信号链，分发 tick、取 SignalResult
+        self.buy_signal: BuyAggregator = BuyAggregator(self)
+        # 卖出总信号：按 vt_symbol 聚合卖出子信号，情绪卖出优先，其次价格卖出
+        self.sell_signal: SellAggregator = SellAggregator(self)
         self.load_bars(1)
 
     def on_start(self) -> None:
@@ -243,7 +252,11 @@ class NearMaSurgeStrategy(StrategyTemplate):
         return tick.datetime.time() >= self.MARKET_OPEN_TIME
 
     def on_tick(self, tick: TickData) -> None:
-        """行情推送回调：日切刷新 + 拉升检测 + 买入/卖出"""
+        """行情推送回调：日切刷新 + 信号分发 + 下单
+
+        策略为协调器：日切刷新标的池、转发行情给信号器、按 ``SignalResult`` 的
+        type 下单；拉升检测/行业过滤/卖出判定均下沉到买入/卖出子信号。
+        """
         # 1. 日切刷新：日期变更且到盘前刷新时刻（09:15），重新拉取当日池
         tick_date: str = tick.datetime.strftime("%Y%m%d")
         if tick_date != self.last_refresh_date:
@@ -254,100 +267,63 @@ class NearMaSurgeStrategy(StrategyTemplate):
         if not self._is_trading_session(tick):
             return
 
-        # 转发 tick 给行业情绪信号器（缓存当前标的与行情，供后续扩展）
-        self.sector_signal.on_tick(tick)
-
         vt_symbol: str = tick.vt_symbol
         pos: int = self.get_pos(vt_symbol)
 
-        # 2. 有持仓且可卖量 > 0 才走卖出分支（止损 / 移动止盈 / 分档止盈）
+        # 2. 有持仓且可卖量 > 0 才走卖出分支（情绪卖出 / 止损 / 移动止盈 / 分档止盈）
         if pos > 0:
             sellable: int = self.get_sellable(vt_symbol)
             if sellable > 0:
                 if vt_symbol not in self.max_profit_pct:
                     self._init_max_profit_from_tick(vt_symbol, tick)
-                sell_msg, sell_vol = self.check_sell_signal(vt_symbol, tick)
-                if sell_msg and sell_vol > 0:
-                    self.sell(vt_symbol, tick.last_price - self.price_add, sell_vol, mark=sell_msg)
-                    self.send_wecom(sell_msg)
+                self.sell_signal.on_tick(tick)
+                result: SignalResult = self.sell_signal.signal_result(vt_symbol)
+                if result.type in (SignalType.SELL, SignalType.CLEAR) and result.volume > 0:
+                    self.sell(vt_symbol, result.price, result.volume, mark=result.reason)
+                    msg: str = self._fmt_sell_msg(vt_symbol, tick, result)
+                    self.write_log(msg)
+                    self.send_wecom(msg)
             return
 
-        # 3. 仅对当日池内、无持仓的标的做拉升检测
+        # 3. 无持仓标的走买入分支：仅当日池内标的才做拉升检测（总信号维护窗口 +
+        #    拉升判定 + 行业过滤）；非池内标的不创建子信号，避免无谓采样与残留
         if vt_symbol not in self.target_symbols:
             return
-        if vt_symbol in self.entered:
-            return
-        if not tick.last_price or tick.last_price <= 0:
-            return
-
-        # 维护窗口内样本，弹出早于 surge_window 秒前的数据
-        window: deque = self.price_windows.setdefault(vt_symbol, deque())
-        window.append((tick.datetime, tick.last_price))
-
-        cutoff: datetime = tick.datetime
-        while window and (cutoff - window[0][0]).total_seconds() > self.surge_window:
-            window.popleft()
-
-        # 4. 拉升判定：窗口内相对最低价涨幅 或 相对昨收涨幅 >= surge_pct（满足其一即可）
-        window_gain: float | None = None
-        if (cutoff - window[0][0]).total_seconds() >= self.MIN_SURGE_SPAN:
-            low_price: float = min(price for _, price in window if price > 0)
-            if low_price > 0:
-                window_gain = (tick.last_price - low_price) / low_price
-
-        day_gain: float | None = None
-        if tick.pre_close > 0:
-            day_gain = (tick.last_price - tick.pre_close) / tick.pre_close
-
-        gain: float | None = None
-        reason: str = ""
-        if window_gain is not None and window_gain >= self.surge_pct:
-            gain = window_gain
-            reason = "窗口"
-        elif day_gain is not None and day_gain >= self.surge_pct:
-            gain = day_gain
-            reason = "昨收"
-
-        if gain is None:
-            return
-
-        # 5. 行业情绪过滤：所属行业评级须在中性以上才允许买入
-        sector_result = self.sector_signal.is_buyable(vt_symbol)
-        name: str = self._get_symbol_name(vt_symbol)
-        if not sector_result.buyable:
-            buy_price: float = tick.last_price + self.price_add
-            skip_msg: str = (
-                f"行业情绪拦截 {vt_symbol}({name}) "
-                f"买入价格 {buy_price:.2f} "
-                f"行业 {sector_result.sector_name} 得分 {sector_result.sector_score:.1f} "
-                f"评级 {sector_result.sector_level}，未达中性以上，不买入"
-            )
-            self.write_log(skip_msg)
-            self.send_wecom(skip_msg)
-            # 标记本轮已处理，避免同一波拉升反复拦截刷屏
+        self.buy_signal.on_tick(tick)
+        result = self.buy_signal.signal_result(vt_symbol)
+        if result.type == SignalType.BUY and result.volume > 0:
+            name: str = self._get_symbol_name(vt_symbol)
+            self.buy(vt_symbol, result.price, result.volume, mark=result.reason)
             self.entered.add(vt_symbol)
+            self.surge_count += 1
+
+            # 记录开仓价（用触发买入的现价近似）与初始最大收益
+            self.entry_prices[vt_symbol] = tick.last_price
+            self.max_profit_pct[vt_symbol] = 0.0
+            self._sync_tracking_state()
+
+            msg = self._fmt_buy_msg(vt_symbol, name, result)
+            self.write_log(msg)
+            self.send_wecom(msg)
             self.put_event()
-            return
 
-        buy_price: float = tick.last_price + self.price_add
-        mark: str = f"{reason}涨幅 {gain * 100:.2f}% 买入价格 {buy_price:.2f} 数量 {self.fixed_size}"
-        self.buy(vt_symbol, buy_price, self.fixed_size, mark=mark)
-        self.entered.add(vt_symbol)
-        self.surge_count += 1
+    def _fmt_buy_msg(self, vt_symbol: str, name: str, result: SignalResult) -> str:
+        """拼接买入信号消息（日志/企微复用）"""
+        return f"快速拉升买入 {vt_symbol}({name}) {result.reason}"
 
-        # 记录开仓价（用触发买入的现价近似）与初始最大收益
-        self.entry_prices[vt_symbol] = tick.last_price
-        self.max_profit_pct[vt_symbol] = 0.0
-        self._sync_tracking_state()
-
-        msg: str = (
-            f"快速拉升买入 {vt_symbol}({name}) {mark} "
-            f"行业 {sector_result.sector_name} 得分 {sector_result.sector_score:.1f} "
-            f"评级 {sector_result.sector_level}"
+    def _fmt_sell_msg(self, vt_symbol: str, tick: TickData, result: SignalResult) -> str:
+        """拼接卖出信号消息（日志/企微复用）"""
+        name: str = self._get_symbol_name(vt_symbol)
+        entry_price: float = self.entry_prices.get(vt_symbol, 0.0)
+        profit_pct: float = (
+            (tick.last_price - entry_price) / entry_price if entry_price > 0 else 0.0
         )
-        self.write_log(msg)
-        self.send_wecom(msg)
-        self.put_event()
+        max_profit: float = self.max_profit_pct.get(vt_symbol, 0.0)
+        return (
+            f"卖出信号 {vt_symbol}({name}) {result.reason} "
+            f"卖出价格 {result.price:.2f} 当前收益 {profit_pct * 100:.2f}% "
+            f"最大收益 {max_profit * 100:.2f}%"
+        )
 
     def on_bars(self, bars: dict[str, BarData]) -> None:
         """K线切片回调（本策略拉升检测走 tick，此处留空）"""
@@ -407,111 +383,6 @@ class NearMaSurgeStrategy(StrategyTemplate):
             f"委托通知 {order.vt_symbol}({name}) 状态 {status} 方向 {direction} "
             f"开平 {offset} 价格 {order.price:.2f} 委托 {order.volume} 成交 {order.traded}"
         )
-
-    def check_sell_signal(self, vt_symbol: str, tick: TickData) -> tuple[str, int]:
-        """卖出信号判定：固定止损 + 分档止盈 + 移动止盈
-
-        返回 ``(卖出说明, 卖出数量)``；说明为空串且数量为 0 表示不卖。
-
-        规则（按优先级）：
-        1. 相对开仓价亏损 >= STOP_LOSS_PCT(2%) → 止损全清；
-        2. 收益 >= clear_profit_pct(默认 20%) → 清仓全清；
-        3. 收益 >= half_profit_pct(默认 10%) 且尚未减半 → 减半卖出（每标的仅触发一次）；
-        4. 记录开仓后最大收益率 ``max_profit``；
-        5. 当前收益相对最大收益回撤 >= MAX_DRAWDOWN_PCT(10%) → 全清；
-        6. 保底收益线（取最高适用档）：
-           - 最大收益 >= 10% → 最低保证 5%；
-           - 最大收益 >= 5%  → 最低保证 2%；
-           - 最大收益 >= 3%  → 不能赔钱（保底 0%）；
-           当前收益跌破保底线 → 全清。
-        """
-        entry_price: float | None = self.entry_prices.get(vt_symbol, None)
-        if not entry_price or entry_price <= 0 or not tick.last_price:
-            return "", 0
-
-        profit_pct: float = (tick.last_price - entry_price) / entry_price
-        sellable: int = self.get_sellable(vt_symbol)
-
-        # 更新历史最大收益率
-        max_profit: float = self.max_profit_pct.get(vt_symbol, 0.0)
-        if profit_pct > max_profit:
-            max_profit = profit_pct
-            self.max_profit_pct[vt_symbol] = max_profit
-            self._sync_tracking_state()
-
-        # 1) 固定止损：相对开仓价亏损超 STOP_LOSS_PCT
-        if profit_pct <= -self.STOP_LOSS_PCT:
-            msg = self._log_sell(
-                vt_symbol, tick, profit_pct, max_profit,
-                f"止损 亏损 {abs(profit_pct) * 100:.2f}% 超过 {self.STOP_LOSS_PCT * 100:.0f}%",
-            )
-            return msg, sellable
-
-        # 2) 清仓止盈：收益达 clear_profit_pct
-        if profit_pct >= self.clear_profit_pct:
-            msg = self._log_sell(
-                vt_symbol, tick, profit_pct, max_profit,
-                f"清仓 收益 {profit_pct * 100:.2f}% 达到 {self.clear_profit_pct * 100:.0f}%",
-            )
-            return msg, sellable
-
-        # 3) 减半止盈：收益达 half_profit_pct 且未减半（每标的仅触发一次）
-        #    卖出量按 100 股向上取整；若取整后 >= 全部可卖量则跳过（避免等于清仓）
-        if profit_pct >= self.half_profit_pct and vt_symbol not in self.halved:
-            half_vol: int = math.ceil(sellable / 2 / 100) * 100
-            if 0 < half_vol < sellable:
-                self.halved.add(vt_symbol)
-                msg = self._log_sell(
-                    vt_symbol, tick, profit_pct, max_profit,
-                    f"减半 收益 {profit_pct * 100:.2f}% 达到 {self.half_profit_pct * 100:.0f}% 卖 {half_vol}",
-                )
-                return msg, half_vol
-
-        # 4) 回撤止盈：相对最大收益回撤超 MAX_DRAWDOWN_PCT
-        drawdown: float = max_profit - profit_pct
-        if drawdown >= self.MAX_DRAWDOWN_PCT:
-            msg = self._log_sell(
-                vt_symbol, tick, profit_pct, max_profit,
-                f"回撤 {drawdown * 100:.2f}% 超过 {self.MAX_DRAWDOWN_PCT * 100:.0f}%",
-            )
-            return msg, sellable
-
-        # 5) 保底收益线
-        floor: float | None = None
-        if max_profit >= self.TIER_HIGH_PCT:
-            floor = self.TIER_HIGH_FLOOR
-        elif max_profit >= self.TIER_LOW_PCT:
-            floor = self.TIER_LOW_FLOOR
-        elif max_profit >= self.TIER_BREAKEVEN_PCT:
-            floor = self.TIER_BREAKEVEN_FLOOR
-
-        if floor is not None and profit_pct < floor:
-            msg = self._log_sell(
-                vt_symbol, tick, profit_pct, max_profit,
-                f"跌破保底 {floor * 100:.0f}%",
-            )
-            return msg, sellable
-
-        return "", 0
-
-    def _log_sell(
-        self,
-        vt_symbol: str,
-        tick: TickData,
-        profit_pct: float,
-        max_profit: float,
-        reason: str,
-    ) -> str:
-        """记录卖出信号日志，并返回同一条说明供 mark / 企微复用"""
-        name: str = self._get_symbol_name(vt_symbol)
-        sell_price: float = tick.last_price - self.price_add
-        msg: str = (
-            f"卖出信号 {vt_symbol}({name}) {reason} "
-            f"卖出价格 {sell_price:.2f} 当前收益 {profit_pct * 100:.2f}% "
-            f"最大收益 {max_profit * 100:.2f}%"
-        )
-        self.write_log(msg)
-        return msg
 
     def refresh_universe(self) -> None:
         """每日刷新标的池：按前一交易日查库取当日成分 → 订阅新标的 → 退订不在池中且无持仓的旧标的
@@ -588,9 +459,10 @@ class NearMaSurgeStrategy(StrategyTemplate):
         ]
         if to_unsubscribe:
             self.strategy_engine.unsubscribe_symbols(self, to_unsubscribe)
-            # 清理已退订标的的窗口/已触发缓存
+            # 清理已退订标的的买入/卖出子信号实例与已触发缓存
             for vt_symbol in to_unsubscribe:
-                self.price_windows.pop(vt_symbol, None)
+                self.buy_signal.remove(vt_symbol)
+                self.sell_signal.remove(vt_symbol)
                 self.entered.discard(vt_symbol)
 
         # 更新状态

@@ -8,6 +8,10 @@
 - ``SectorBuySignal``：根据标的所属申万二级行业的情绪分，判断是否可买入。
 - ``MarketRiskOffSignal``：根据全市场综合情绪分，判断是否需要全部清仓。
 
+另含卖出侧的行业判定器：
+- ``SectorSellSignal``：根据标的所属申万二级行业的情绪分，判断是否应卖出离场
+  （评级中性以下）。与 ``SectorBuySignal`` 对称，各自独立的结果类型与判定器。
+
 降级原则（缺数据时偏保守）：
 - 买入信号：情绪 App 未加载 / 标的未映射到行业 / 快照不可用 → 不买入。
 - 清仓信号：情绪 App 未加载 / 快照不可用或过期 → 不触发清仓。
@@ -53,9 +57,29 @@ class SectorBuyResult:
     ``buyable`` 为是否允许买入；``sector_name`` / ``sector_score`` /
     ``sector_level`` 供策略展示与消息推送。降级或未映射行业时字段为空，
     ``sector_level`` 标注降级原因（如 "不可用" / "未分行业"）。
+    ``below_neutral`` 表示行业评级是否严格在中性以下（偏弱 / 极弱），
+    降级（不可用 / 未分行业 / 未映射）时为 False，供策略据此离场而非误判。
     """
 
     buyable: bool
+    sector_name: str = ""
+    sector_score: float = 0.0
+    sector_level: str = ""
+    below_neutral: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class SectorSellResult:
+    """行业应卖信号判定结果。
+
+    ``sellable`` 为是否应因行业情绪离场（评级在中性以下，偏弱 / 极弱）；
+    ``sector_name`` / ``sector_score`` / ``sector_level`` 供策略展示与消息推送。
+    降级或未映射行业时字段为空，``sector_level`` 标注降级原因（如 "不可用" /
+    "未分行业"）。降级（不可用 / 未分行业 / 未映射）时 ``sellable`` 为 False，
+    不触发离场，交价格卖出处理。
+    """
+
+    sellable: bool
     sector_name: str = ""
     sector_score: float = 0.0
     sector_level: str = ""
@@ -154,6 +178,12 @@ class SectorBuySignal(SentimentSignal):
         SentimentLevel.EXTREME_BULLISH,
     } if SentimentLevel is not None else set()
 
+    # 中性以下（不包含中性）的评级集合：偏弱 / 极弱
+    BELOW_NEUTRAL_LEVELS: set = {
+        SentimentLevel.BEARISH,
+        SentimentLevel.EXTREME_BEARISH,
+    } if SentimentLevel is not None else set()
+
     def __init__(self, strategy: StrategyTemplate) -> None:
         super().__init__(strategy)
         # 可观测变量，供策略展示/日志
@@ -186,38 +216,121 @@ class SectorBuySignal(SentimentSignal):
             self.sector_name = ""
             self.sector_score = 0.0
             self.sector_level = ""
-            return SectorBuyResult(False, "", 0.0, "")
+            return SectorBuyResult(False, "", 0.0, "", False)
         engine = self._get_engine()
         if engine is None:
-            return SectorBuyResult(False, "", 0.0, "不可用")
+            return SectorBuyResult(False, "", 0.0, "不可用", False)
         qmt_symbol: str = self._vt_to_qmt(vt_symbol)
         if not qmt_symbol:
             self.sector_name = ""
             self.sector_score = 0.0
             self.sector_level = ""
-            return SectorBuyResult(False, "", 0.0, "")
+            return SectorBuyResult(False, "", 0.0, "", False)
         state = engine.get_stock_sector(qmt_symbol)
         if state is None:
             # 未分到行业或该行业有效家数不够，保守不买
             self.sector_name = ""
             self.sector_score = 0.0
             self.sector_level = "未分行业"
-            return SectorBuyResult(False, "", 0.0, "未分行业")
+            return SectorBuyResult(False, "", 0.0, "未分行业", False)
         # 更新可观测变量
         self.sector_name = state.name
         self.sector_score = state.score
         self.sector_level = state.level.value
         buyable: bool = self._evaluate(state)
+        below_neutral: bool = state.level in self.BELOW_NEUTRAL_LEVELS
         return SectorBuyResult(
             buyable,
+            state.name,
+            state.score,
+            state.level.value,
+            below_neutral,
+        )
+
+    def _evaluate(self, state: SectorState) -> bool:
+        """行业情绪是否允许买入：评级在中性及以上放行。"""
+        return state.level in self.BUYABLE_LEVELS
+
+
+class SectorSellSignal(SentimentSignal):
+    """行业应卖信号器：判断标的所属申万二级行业情绪是否需要离场。
+
+    规则：行业评级在中性以下（偏弱 / 极弱）时应卖出离场，其余（中性 / 偏强 / 极强 /
+    不可用 / 未分行业）不触发。阈值写死，不暴露为策略参数。与 ``SectorBuySignal`` 对称：
+    买入侧判定"中性以上可买"，卖出侧判定"中性以下应卖"，各自独立的判定器与结果类型。
+    """
+
+    # 中性以下（不包含中性）的评级集合：偏弱 / 极弱
+    SELLABLE_LEVELS: set = {
+        SentimentLevel.BEARISH,
+        SentimentLevel.EXTREME_BEARISH,
+    } if SentimentLevel is not None else set()
+
+    def __init__(self, strategy: StrategyTemplate) -> None:
+        super().__init__(strategy)
+        # 可观测变量，供策略展示/日志
+        self.sector_name: str = ""
+        self.sector_score: float = 0.0
+        self.sector_level: str = ""
+        # 当前判定的标的，由 on_tick / on_bar 维护，is_sellable 不传参时取它
+        self.vt_symbol: str = ""
+
+    def on_tick(self, tick: TickData) -> None:
+        """行情推送回调：缓存 tick 并记录当前标的。"""
+        super().on_tick(tick)
+        self.vt_symbol = tick.vt_symbol
+
+    def on_bar(self, bar: BarData) -> None:
+        """K线推送回调：缓存 bar 并记录当前标的。"""
+        super().on_bar(bar)
+        self.vt_symbol = bar.vt_symbol
+
+    def is_sellable(self, vt_symbol: str | None = None) -> SectorSellResult:
+        """行业情绪是否应卖出离场该标的。
+
+        ``vt_symbol`` 未传时，取最近一次 ``on_tick`` / ``on_bar`` 推送的标的。
+        返回 ``SectorSellResult``，含 sellable / 行业名 / 得分 / 评级。
+        降级原则：引擎不可用、标的未映射到行业、行业有效家数不足 → sellable=False，
+        不触发离场，交价格卖出处理。
+        """
+        if vt_symbol is None:
+            vt_symbol = self.vt_symbol
+        if not vt_symbol:
+            self.sector_name = ""
+            self.sector_score = 0.0
+            self.sector_level = ""
+            return SectorSellResult(False, "", 0.0, "")
+        engine = self._get_engine()
+        if engine is None:
+            return SectorSellResult(False, "", 0.0, "不可用")
+        qmt_symbol: str = self._vt_to_qmt(vt_symbol)
+        if not qmt_symbol:
+            self.sector_name = ""
+            self.sector_score = 0.0
+            self.sector_level = ""
+            return SectorSellResult(False, "", 0.0, "")
+        state = engine.get_stock_sector(qmt_symbol)
+        if state is None:
+            # 未分到行业或该行业有效家数不够，不触发离场
+            self.sector_name = ""
+            self.sector_score = 0.0
+            self.sector_level = "未分行业"
+            return SectorSellResult(False, "", 0.0, "未分行业")
+        # 更新可观测变量
+        self.sector_name = state.name
+        self.sector_score = state.score
+        self.sector_level = state.level.value
+        sellable: bool = self._evaluate(state)
+        return SectorSellResult(
+            sellable,
             state.name,
             state.score,
             state.level.value,
         )
 
     def _evaluate(self, state: SectorState) -> bool:
-        """行业情绪是否允许买入：评级在中性及以上放行。"""
-        return state.level in self.BUYABLE_LEVELS
+        """行业情绪是否应卖出离场：评级在中性以下（偏弱 / 极弱）触发。"""
+        return state.level in self.SELLABLE_LEVELS
 
 
 class MarketRiskOffSignal(SentimentSignal):
