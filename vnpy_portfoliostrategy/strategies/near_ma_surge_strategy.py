@@ -138,12 +138,16 @@ class NearMaSurgeStrategy(StrategyTemplate):
         ``on_tick`` 日切逻辑触发。
         """
         self.write_log("策略初始化")
+        t = datetime.now()
         self._restore_subscribed_symbols()
+        self.write_log(f"还原订阅总耗时 {(datetime.now() - t).total_seconds():.2f}s")
         # 买入总信号：按 vt_symbol 聚合拉升 + 行业过滤子信号链，分发 tick、取 SignalResult
         self.buy_signal: BuyAggregator = BuyAggregator(self)
         # 卖出总信号：按 vt_symbol 聚合卖出子信号，情绪卖出优先，其次价格卖出
         self.sell_signal: SellAggregator = SellAggregator(self)
+        t = datetime.now()
         self.load_bars(1)
+        self.write_log(f"load_bars 耗时 {(datetime.now() - t).total_seconds():.2f}s")
 
     def on_start(self) -> None:
         """策略启动回调"""
@@ -162,6 +166,8 @@ class NearMaSurgeStrategy(StrategyTemplate):
             if position != 0
         )
 
+        # 读取持久化数据（strategy_data 已在引擎启动时 load_json 进内存，此处为字典查找）
+        t_read: datetime = datetime.now()
         data: dict = self.strategy_engine.strategy_data.get(self.strategy_name, {}) or {}
         saved_targets: dict = data.get("target_symbols") or {}
         if isinstance(saved_targets, dict):
@@ -172,13 +178,21 @@ class NearMaSurgeStrategy(StrategyTemplate):
                 vt_symbol for vt_symbol, position in saved_pos.items()
                 if position
             )
+        self.write_log(
+            f"还原-读取持久化数据耗时 {(datetime.now() - t_read).total_seconds():.4f}s"
+        )
 
         to_subscribe: list[str] = [
             vt_symbol for vt_symbol in restored
             if vt_symbol not in self.subscribed_symbols
         ]
+        t_sub: datetime = datetime.now()
         if to_subscribe:
             self.strategy_engine.subscribe_symbols(self, to_subscribe)
+        self.write_log(
+            f"还原-订阅行情耗时 {(datetime.now() - t_sub).total_seconds():.2f}s "
+            f"补订 {len(to_subscribe)} 只"
+        )
         self.subscribed_symbols = restored
         if restored:
             self.write_log(f"订阅集合已还原：{len(restored)} 只")
@@ -399,7 +413,12 @@ class NearMaSurgeStrategy(StrategyTemplate):
 
         # 取数日期：DB 数据按前一交易日生成，直接查前一交易日的行
         today: str = datetime.now().strftime("%Y%m%d")
+        t_trade_date: datetime = datetime.now()
         trade_date: str = self._previous_trade_date()
+        self.write_log(
+            f"刷新-取前一交易日耗时 {(datetime.now() - t_trade_date).total_seconds():.2f}s "
+            f"trade_date={trade_date}"
+        )
         sector: str = self.industry_name.replace("'", "''")
         # 显式列出全部列，按 stock_near_ma 表结构
         sql: str = (
@@ -408,10 +427,18 @@ class NearMaSurgeStrategy(StrategyTemplate):
             f"FROM {self.TABLE_NAME} "
             f"WHERE sector_name = '{sector}' AND trade_date = '{trade_date}'"
         )
+        t_query: datetime = datetime.now()
         try:
             rows: list[dict] = sql_engine.query_all(sql)
+            self.write_log(
+                f"刷新-数据库查询耗时 {(datetime.now() - t_query).total_seconds():.2f}s "
+                f"返回 {len(rows)} 行"
+            )
         except Exception as exc:  # noqa: BLE001 - 查询失败写日志，不影响策略运行
-            self.write_log(f"查询 {self.TABLE_NAME} 失败：{exc}")
+            self.write_log(
+                f"查询 {self.TABLE_NAME} 失败（耗时 "
+                f"{(datetime.now() - t_query).total_seconds():.2f}s）：{exc}"
+            )
             return
 
         # 标记今日已尝试刷新（用日历当天，供 on_tick 日切检测），避免每 tick 重复查库
