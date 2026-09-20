@@ -72,6 +72,7 @@ class StrategyEngine(BaseEngine):
         self.symbol_strategy_map: dict[str, list[StrategyTemplate]] = defaultdict(list)
         self.orderid_strategy_map: dict[str, StrategyTemplate] = {}
         self.orderid_reference_map: dict[str, str] = {}                 # vt_orderid: reference
+        self.orderid_mark_map: dict[str, str] = {}                      # vt_orderid: mark
 
         self.init_executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=1)
 
@@ -149,6 +150,10 @@ class StrategyEngine(BaseEngine):
             order.vt_orderid,
             order.reference
         )
+        order.mark = self.orderid_mark_map.get(
+            order.vt_orderid,
+            order.mark
+        )
 
         strategy: StrategyTemplate | None = self.orderid_strategy_map.get(order.vt_orderid, None)
         if not strategy:
@@ -165,6 +170,7 @@ class StrategyEngine(BaseEngine):
         # 委托终结后清理本地缓存
         if not order.is_active():
             self.orderid_reference_map.pop(order.vt_orderid, None)
+            self.orderid_mark_map.pop(order.vt_orderid, None)
 
     def process_trade_event(self, event: Event) -> None:
         """成交数据推送"""
@@ -236,7 +242,8 @@ class StrategyEngine(BaseEngine):
             type=OrderType.LIMIT,
             price=price,
             volume=volume,
-            reference=self.create_order_reference(strategy, mark)
+            reference=self.create_order_reference(strategy),
+            mark=mark
         )
 
         req_list: list[OrderRequest] = self.main_engine.convert_order_request(
@@ -258,6 +265,7 @@ class StrategyEngine(BaseEngine):
             vt_orderids.append(vt_orderid)
 
             self.orderid_reference_map[vt_orderid] = req.reference
+            self.orderid_mark_map[vt_orderid] = req.mark
 
             self.main_engine.update_order_request(req, vt_orderid, contract.gateway_name)
 
@@ -270,18 +278,9 @@ class StrategyEngine(BaseEngine):
         return vt_orderids
 
     @staticmethod
-    def create_order_reference(strategy: StrategyTemplate, mark: str) -> str:
-        """构造委托 reference：APP_NAME_策略名[:mark]"""
-        reference: str = f"{APP_NAME}_{strategy.strategy_name}"
-        if mark:
-            reference = f"{reference}:{mark}"
-        return reference
-
-    @staticmethod
-    def get_order_mark(reference: str) -> str:
-        """从 reference 中提取触发标记（mark）"""
-        _, separator, mark = reference.partition(":")
-        return mark if separator else ""
+    def create_order_reference(strategy: StrategyTemplate) -> str:
+        """构造委托 reference：APP_NAME_策略名"""
+        return f"{APP_NAME}_{strategy.strategy_name}"
 
     def cancel_order(self, strategy: StrategyTemplate, vt_orderid: str) -> None:
         """委托撤单"""

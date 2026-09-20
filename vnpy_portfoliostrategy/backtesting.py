@@ -696,8 +696,6 @@ class BacktestingEngine:
         self.limit_order_count += 1
 
         reference: str = f"{APP_NAME}_{strategy.strategy_name}"
-        if mark:
-            reference = f"{reference}:{mark}"
 
         order: OrderData = OrderData(
             symbol=symbol,
@@ -711,6 +709,7 @@ class BacktestingEngine:
             datetime=self.datetime,
             gateway_name=self.gateway_name,
             reference=reference,
+            mark=mark,
         )
 
         self.active_limit_orders[order.vt_orderid] = order

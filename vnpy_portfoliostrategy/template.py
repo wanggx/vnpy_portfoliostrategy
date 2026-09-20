@@ -256,9 +256,8 @@ class StrategyTemplate(ABC):
 
     @staticmethod
     def get_order_mark(order: OrderData) -> str:
-        """从委托 reference 中提取触发标记（mark）"""
-        _, separator, mark = order.reference.partition(":")
-        return mark if separator else ""
+        """获取委托的触发标记（mark）"""
+        return order.mark
 
     def cancel_order(self, vt_orderid: str) -> None:
         """撤销委托"""
