@@ -8,14 +8,15 @@
    亏损交给价格止损，避免抢先绕过 2% 止损线。降级（不可用/未分行业/未映射）不触发。
    命中即短路，价格卖出不跑。
 2. ``PriceSellSubSignal``（其次）：价格卖出。相对开仓价亏损 2% 止损、收益达
-   clear_profit_pct 清仓、达 half_profit_pct 仓位减半（每标的仅一次）、回撤超
-   MAX_DRAWDOWN_PCT 卖出，以及保底收益线（最大收益 >= 10% 保底 5%、>= 5% 保底 2%、
-   >= 3% 保底 0%）。
+   clear_profit_pct 清仓、达 half_profit_pct 仓位减半（仓位减半后剩余不足一个标准开仓量
+   fixed_size，据此不再重复减半）、回撤超 MAX_DRAWDOWN_PCT 卖出，以及保底收益线
+   （最大收益 >= 10% 保底 5%、>= 5% 保底 2%、>= 3% 保底 0%）。
 
 减半产出 ``SELL``（部分卖出），其余卖出产出 ``CLEAR``（全清）。
 
-需要持久化的全局状态（``entry_prices`` / ``max_profit_pct`` / ``halved``）经
-``self.strategy`` 读写；行业评级由 ``SectorSellSubSignal`` 自持的 ``SectorSellSignal`` 实例取。
+需要持久化的全局状态（``entry_prices`` / ``max_profit_pct``）经 ``self.strategy`` 读写；
+是否已减半由可卖量是否不足 ``fixed_size`` 推断，不另存标记。行业评级由
+``SectorSellSubSignal`` 自持的 ``SectorSellSignal`` 实例取。
 ``PrioritySellSubSignal.on_tick`` 在跑子信号前统一更新历史最大收益（公共前置），供两子信号共用。
 """
 
@@ -96,8 +97,8 @@ class SectorSellSubSignal(SubSignal):
 class PriceSellSubSignal(SubSignal):
     """单标的价格卖出子信号（其次）：止损 / 分档止盈 / 回撤 / 保底。
 
-    ``on_tick`` 按优先级判定价格维度卖出规则，命中缓存首个结果（含 ``halved.add`` 副作用），
-    未命中 NONE。``prev`` 忽略（优先级组合内的独立判定支）。
+    ``on_tick`` 按优先级判定价格维度卖出规则，命中缓存首个结果，未命中 NONE。
+    ``prev`` 忽略（优先级组合内的独立判定支）。判定无副作用：是否已减半由可卖量推断。
     """
 
     def __init__(self, vt_symbol: str, strategy: StrategyTemplate) -> None:
@@ -115,7 +116,10 @@ class PriceSellSubSignal(SubSignal):
 
         profit_pct: float = (tick.last_price - entry_price) / entry_price
         sellable: int = s.get_sellable(self.vt_symbol)
-        is_halved: bool = self.vt_symbol in s.halved
+        # 是否已减半：不另存标记，用可卖量判定——满仓时为 fixed_size，减半后必然小于它。
+        # 走 T+1 时 sellable 已扣除卖出冻结量，减半委托在途（未成交）也算已减半，
+        # 避免委托未成交期间价格反复越过阈值而重复减半；撤单/拒单释放冻结量后恢复满仓。
+        is_halved: bool = 0 < sellable < s.fixed_size
         max_profit: float = s.max_profit_pct.get(self.vt_symbol, 0.0)
         sell_price: float = tick.last_price - s.price_add
 
@@ -135,7 +139,7 @@ class PriceSellSubSignal(SubSignal):
         is_halved: bool,
         sell_price: float,
     ) -> SignalResult:
-        """按优先级完成价格卖出判定（含副作用），返回首个命中结果。"""
+        """按优先级完成价格卖出判定（无副作用），返回首个命中结果。"""
         s = self.strategy
 
         # 1) 固定止损：相对开仓价亏损超 STOP_LOSS_PCT → 全清
@@ -162,12 +166,11 @@ class PriceSellSubSignal(SubSignal):
                 ),
             )
 
-        # 3) 减半止盈：收益达 half_profit_pct 且未减半（每标的仅触发一次）
+        # 3) 减半止盈：收益达 half_profit_pct 且仓位未减半
         #    卖出量按 100 股向上取整；若取整后 >= 全部可卖量则跳过（避免等于清仓）
         if profit_pct >= s.half_profit_pct and not is_halved:
             half_vol: int = math.ceil(sellable / 2 / 100) * 100
             if 0 < half_vol < sellable:
-                s.halved.add(self.vt_symbol)
                 return SignalResult(
                     type=SignalType.SELL,
                     volume=half_vol,

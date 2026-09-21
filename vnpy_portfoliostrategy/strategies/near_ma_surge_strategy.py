@@ -35,8 +35,9 @@ class NearMaSurgeStrategy(StrategyTemplate):
     卖出信号由两类信号器组合，情绪卖出优先：行业情绪卖出信号在收益低于 3% 且
     所属行业评级转为中性以下（偏弱/极弱）时主动离场全清；价格卖出信号负责相对
     开仓价亏损 2% 止损、收益达 clear_profit_pct(默认 20%) 清仓、达
-    half_profit_pct(默认 10%) 仓位减半（每标的仅减半一次）、回撤超过 10% 卖出，
-    以及最大收益 >= 10% 保底 5%、>= 5% 保底 2%、>= 3% 不赔钱的保底收益线。
+    half_profit_pct(默认 10%) 仓位减半（剩余可卖量不足 fixed_size 后不再减半）、
+    回撤超过 10% 卖出，以及最大收益 >= 10% 保底 5%、>= 5% 保底 2%、>= 3% 不赔钱的
+    保底收益线。
 
     信号架构分两层：买入/卖出各一个总信号（``BuyAggregator`` / ``SellAggregator``），
     内部按 ``vt_symbol`` 维护子信号映射并分发行情；子信号经 ``signal_result()`` 返回
@@ -124,11 +125,11 @@ class NearMaSurgeStrategy(StrategyTemplate):
         # 本轮已触发买入的标的，避免同一波拉升重复下单（含行业拦截也标记）
         self.entered: set[str] = set()
 
-        # 持仓追踪：开仓价与开仓后最大收益率，用于移动止盈
+        # 持仓追踪：开仓价与开仓后最大收益率，用于移动止盈。
+        # 开仓价在一轮持仓内不可变：只在建仓成交时确定一次，之后的涨跌比例、止损、
+        # 清仓/减半止盈、回撤与保底全部以它为准；分笔成交、加仓、经纪商持仓回报都不得改动
         self.entry_prices: dict[str, float] = {}
         self.max_profit_pct: dict[str, float] = {}
-        # 减半标记：记录已触发减半的标的，避免同一标的多于一次减半（清仓后清理）
-        self.halved: set[str] = set()
 
     def on_init(self) -> None:
         """策略初始化回调
@@ -220,25 +221,25 @@ class NearMaSurgeStrategy(StrategyTemplate):
         yd_volume: float,
         price: float = 0,
     ) -> None:
-        """同步 T+1 持仓，并用经纪商持仓均价恢复开仓成本"""
+        """同步 T+1 持仓，并（仅在本地缺失时）用经纪商持仓均价兜底开仓成本"""
         super().sync_t1_position(vt_symbol, volume, yd_volume, price)
 
         broker_price: float = self.get_pos_price(vt_symbol)
         if int(volume) > 0:
-            changed: bool = False
-            if broker_price > 0 and self.entry_prices.get(vt_symbol) != broker_price:
+            # 经纪商成本价只在本地没有开仓价时兜底（重启后手工建仓、JSON 丢失）；
+            # 不能用它覆盖已有开仓价：A 股券商/QMT 返回的多为「摊薄成本价」，部分卖出
+            # 后已实现盈利会摊低成本价（如 10 元买 500 股、11 元卖 300 股后成本变 8.5 元），
+            # 覆盖会让剩余仓位的收益率从 10% 瞬间跳到 29%，立刻误触 clear_profit_pct 清仓。
+            if broker_price > 0 and vt_symbol not in self.entry_prices:
                 self.entry_prices[vt_symbol] = broker_price
-                changed = True
-            self.entered.add(vt_symbol)
-            if changed:
                 self._sync_tracking_state()
+            self.entered.add(vt_symbol)
         else:
             if vt_symbol in self.entry_prices or vt_symbol in self.max_profit_pct:
                 self.entry_prices.pop(vt_symbol, None)
                 self.max_profit_pct.pop(vt_symbol, None)
                 self._sync_tracking_state()
             self.entered.discard(vt_symbol)
-            self.halved.discard(vt_symbol)
 
     def _sync_tracking_state(self) -> None:
         """持久化 entry_prices / max_profit_pct 到 portfolio_strategy_data.json"""
@@ -313,7 +314,8 @@ class NearMaSurgeStrategy(StrategyTemplate):
             self.entered.add(vt_symbol)
             self.surge_count += 1
 
-            # 记录开仓价（用触发买入的现价近似）与初始最大收益
+            # 记录开仓价（用触发买入的现价近似）与初始最大收益。是否已减半由可卖量
+            # 与 fixed_size 比较推断，无需额外的减半标记或复位
             self.entry_prices[vt_symbol] = tick.last_price
             self.max_profit_pct[vt_symbol] = 0.0
             self._sync_tracking_state()
@@ -352,13 +354,13 @@ class NearMaSurgeStrategy(StrategyTemplate):
         vt_symbol: str = trade.vt_symbol
         tracking_changed: bool = False
         if trade.direction == Direction.LONG:
-            # 开仓：用实际成交价修正开仓价（买入信号时用的是触发价近似）
-            if vt_symbol not in self.entry_prices:
+            # 建仓成交（成交前仓位为 0）：用实际成交价确定开仓价，替代下单时的触发价近似。
+            # 建仓之后开仓价不再被任何事件改动（分笔成交、加仓、经纪商持仓回报都不动）：
+            # 涨跌比例全部以这一次确定的开仓价为准，这是减半/清仓/止损判定的唯一基准。
+            pos_before: int = self.get_pos(vt_symbol) - int(trade.volume)
+            if pos_before <= 0:
                 self.entry_prices[vt_symbol] = trade.price
                 self.max_profit_pct[vt_symbol] = 0.0
-                tracking_changed = True
-            elif self.entry_prices.get(vt_symbol) != trade.price:
-                self.entry_prices[vt_symbol] = trade.price
                 tracking_changed = True
         else:
             # 平仓后仓位归零则清理追踪，允许后续新一轮拉升再进
@@ -368,7 +370,6 @@ class NearMaSurgeStrategy(StrategyTemplate):
                     self.max_profit_pct.pop(vt_symbol, None)
                     tracking_changed = True
                 self.entered.discard(vt_symbol)
-                self.halved.discard(vt_symbol)
 
         if tracking_changed:
             self._sync_tracking_state()
