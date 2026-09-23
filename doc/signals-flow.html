@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Near-Ma 快速拉升策略 · 买入 / 卖出逻辑流程图</title>
+<style>
+  :root { color-scheme: light; }
+  body {
+    margin: 0; padding: 32px 20px 56px;
+    font-family: "Microsoft YaHei", "PingFang SC", system-ui, -apple-system, sans-serif;
+    background: #f1f5f9; color: #0f172a; line-height: 1.6;
+  }
+  .wrap { max-width: 1140px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 0 0 6px; }
+  h2 { font-size: 17px; margin: 0 0 4px; }
+  h3 { font-size: 14px; margin: 22px 0 8px; }
+  .sub { color: #64748b; font-size: 13px; margin: 0 0 22px; }
+  .card {
+    background: #fff; border: 1px solid #e2e8f0; border-radius: 14px;
+    padding: 20px 22px 14px; margin-bottom: 24px;
+    box-shadow: 0 1px 2px rgba(15, 23, 42, .04);
+  }
+  .hint { color: #64748b; font-size: 12.5px; margin: 0 0 12px; }
+  svg { display: block; width: 100%; height: auto; }
+  svg text { font-family: "Microsoft YaHei", "PingFang SC", system-ui, sans-serif; font-size: 13px; fill: #0f172a; }
+  svg .t-title { font-size: 14px; font-weight: 600; }
+  svg .t-label { font-size: 12px; fill: #64748b; }
+  svg .t-note { font-size: 12px; fill: #475569; }
+  .node      { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.6; }
+  .node-t    { fill: #f1f5f9; stroke: #94a3b8; stroke-width: 1.6; }
+  .node-d    { fill: #fff7ed; stroke: #fb923c; stroke-width: 1.6; }
+  .node-g    { fill: #f5f3ff; stroke: #a78bfa; stroke-width: 1.6; }
+  .node-a    { fill: #eff6ff; stroke: #60a5fa; stroke-width: 1.6; }
+  .node-b    { fill: #fef2f2; stroke: #f87171; stroke-width: 1.6; }
+  .node-hit  { fill: #ecfdf5; stroke: #34d399; stroke-width: 1.6; }
+  .node-n    { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 1.4; stroke-dasharray: 6 5; }
+  .arrow { stroke: #94a3b8; stroke-width: 1.6; }
+  .dash  { stroke: #cbd5e1; stroke-width: 1.4; stroke-dasharray: 5 5; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { border: 1px solid #e2e8f0; padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: #f8fafc; font-weight: 600; }
+  code { background: #f1f5f9; padding: 1px 5px; border-radius: 4px; font-size: 12.5px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 12.5px; color: #475569; margin: 2px 0 16px; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .sw { width: 15px; height: 15px; border-radius: 4px; border: 1.6px solid #cbd5e1; background: #fff; display: inline-block; }
+  .sw-d { border-color: #fb923c; background: #fff7ed; }
+  .sw-g { border-color: #a78bfa; background: #f5f3ff; }
+  .sw-a { border-color: #60a5fa; background: #eff6ff; }
+  .sw-b { border-color: #f87171; background: #fef2f2; }
+  .sw-hit { border-color: #34d399; background: #ecfdf5; }
+  .sw-t { border-color: #94a3b8; background: #f1f5f9; }
+  .sw-n { border-color: #cbd5e1; background: #f8fafc; border-style: dashed; }
+  details { margin-top: 14px; font-size: 13px; }
+  summary { cursor: pointer; color: #475569; }
+  pre { background: #0f172a; color: #e2e8f0; padding: 14px 16px; border-radius: 10px; overflow-x: auto; font-size: 12.5px; }
+  .foot { color: #94a3b8; font-size: 12px; text-align: center; margin-top: 28px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>Near-Ma 快速拉升策略 · 买入 / 卖出逻辑</h1>
+  <p class="sub">
+    代码位置：<code>vnpy_portfoliostrategy/strategies/near_ma_surge_strategy.py</code>（协调器、
+    参数与状态） · <code>vnpy_portfoliostrategy/signals/buy_signals.py</code>（买入链） ·
+    <code>vnpy_portfoliostrategy/signals/sell_signals.py</code>（卖出链） ·
+    <code>vnpy_portfoliostrategy/signals/sentiment_signals.py</code>（大盘 / 行业情绪判定）
+  </p>
+
+  <div class="legend">
+    <span><i class="sw sw-t"></i>起点 / 终点</span>
+    <span><i class="sw sw-d"></i>判定</span>
+    <span><i class="sw sw-g"></i>策略门槛</span>
+    <span><i class="sw sw-a"></i>动作</span>
+    <span><i class="sw sw-b"></i>拦截（不交易）</span>
+    <span><i class="sw sw-hit"></i>命中 → 卖出</span>
+    <span><i class="sw sw-n"></i>注释（旁注）</span>
+  </div>
+
+  <!-- ==================== 买入 ==================== -->
+  <div class="card">
+    <h2>一、买入逻辑</h2>
+    <p class="hint">
+      入口是策略的 <code>on_tick</code>；四道前置门 + 拉升检测（OR）+ 大盘分档的行业准入，
+      全部通过才下单 <code>fixed_size</code> 股。任一环节不通过则本 tick 无操作。
+    </p>
+
+    <svg viewBox="0 0 1040 1070" role="img" aria-label="买入流程图">
+      <defs>
+        <marker id="arB" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/>
+        </marker>
+      </defs>
+
+      <!-- 起点 -->
+      <g transform="translate(50,40)">
+        <rect class="node-t" width="340" height="70" rx="10"/>
+        <text x="170" y="40" text-anchor="middle">tick 到达（09:30 连续竞价后）</text>
+      </g>
+      <line class="arrow" x1="220" y1="110" x2="220" y2="142" marker-end="url(#arB)"/>
+
+      <!-- 门1 持仓 -->
+      <g transform="translate(50,150)">
+        <rect class="node-d" width="340" height="70" rx="10"/>
+        <text x="170" y="32" text-anchor="middle"><tspan x="170">① 已持仓？</tspan><tspan x="170" dy="18">（持仓 &gt; 0 走卖出分支）</tspan></text>
+      </g>
+      <line class="arrow" x1="392" y1="185" x2="512" y2="185" marker-end="url(#arB)"/>
+      <text class="t-label" x="452" y="178" text-anchor="middle">是</text>
+      <g transform="translate(520,150)">
+        <rect class="node-hit" width="480" height="70" rx="10"/>
+        <text x="240" y="40" text-anchor="middle">⇒ 走卖出流程（见下方卖出图）</text>
+      </g>
+      <line class="arrow" x1="220" y1="220" x2="220" y2="252" marker-end="url(#arB)"/>
+
+      <!-- 门2 当日池 -->
+      <g transform="translate(50,260)">
+        <rect class="node-d" width="340" height="70" rx="10"/>
+        <text x="170" y="32" text-anchor="middle"><tspan x="170">② 在当日标的池内？</tspan><tspan x="170" dy="18">target_symbols（09:15 按行业刷新）</tspan></text>
+      </g>
+      <line class="arrow" x1="392" y1="295" x2="512" y2="295" marker-end="url(#arB)"/>
+      <text class="t-label" x="452" y="288" text-anchor="middle">否</text>
+      <g transform="translate(520,260)">
+        <rect class="node" width="480" height="70" rx="10"/>
+        <text x="240" y="40" text-anchor="middle">忽略该标的：非池内不采样、不判定</text>
+      </g>
+      <line class="arrow" x1="220" y1="330" x2="220" y2="362" marker-end="url(#arB)"/>
+
+      <!-- 门3 买入前置 -->
+      <g transform="translate(50,370)">
+        <rect class="node-d" width="340" height="70" rx="10"/>
+        <text x="170" y="25" text-anchor="middle"><tspan x="170">③ 买入前置全部通过？</tspan><tspan x="170" dy="18">未触发过 entered · 不在冷却期</tspan><tspan x="170" dy="18">价格有效</tspan></text>
+      </g>
+      <line class="arrow" x1="392" y1="405" x2="512" y2="405" marker-end="url(#arB)"/>
+      <text class="t-label" x="452" y="398" text-anchor="middle">否</text>
+      <g transform="translate(520,370)">
+        <rect class="node" width="480" height="70" rx="10"/>
+        <text x="240" y="32" text-anchor="middle"><tspan x="240">忽略：已触发过 / 冷却期内 / 价格无效</tspan><tspan x="240" dy="18">—— 防同一波重复下单、防反复止损</tspan></text>
+      </g>
+      <line class="arrow" x1="220" y1="440" x2="220" y2="472" marker-end="url(#arB)"/>
+
+      <!-- 门4 拉升检测 -->
+      <g transform="translate(50,480)">
+        <rect class="node-g" width="340" height="70" rx="10"/>
+        <text x="170" y="25" text-anchor="middle"><tspan x="170">④ 拉升检测（OR，任一命中即可）</tspan><tspan x="170" dy="18">窗口内相对最低价涨幅 ≥ surge_pct</tspan><tspan x="170" dy="18">或 相对昨收涨幅 ≥ surge_pct</tspan></text>
+      </g>
+      <line class="arrow" x1="392" y1="515" x2="512" y2="515" marker-end="url(#arB)"/>
+      <text class="t-label" x="452" y="508" text-anchor="middle">否</text>
+      <g transform="translate(520,480)">
+        <rect class="node" width="480" height="70" rx="10"/>
+        <text x="240" y="40" text-anchor="middle">本轮无操作，等下一个 tick（窗口继续采样）</text>
+      </g>
+      <line class="arrow" x1="220" y1="550" x2="220" y2="582" marker-end="url(#arB)"/>
+
+      <!-- 门5 情绪准入 -->
+      <g transform="translate(50,590)">
+        <rect class="node-g" width="340" height="90" rx="10"/>
+        <text x="170" y="25" text-anchor="middle"><tspan x="170">⑤ 情绪准入（大盘分档）</tspan><tspan x="170" dy="18">大盘 偏强 / 极强 → 行业需 中性及以上</tspan><tspan x="170" dy="18">大盘 中性及以下 或 数据不可信</tspan><tspan x="170" dy="18">→ 行业需 偏强 / 极强（不含中性）</tspan></text>
+      </g>
+      <line class="arrow" x1="392" y1="635" x2="512" y2="635" marker-end="url(#arB)"/>
+      <text class="t-label" x="452" y="628" text-anchor="middle">否</text>
+      <g transform="translate(520,590)">
+        <rect class="node-b" width="480" height="90" rx="10"/>
+        <text x="240" y="32" text-anchor="middle"><tspan x="240">拦截：不买入，写日志 + 企微</tspan><tspan x="240" dy="18">entered 标记，当日不再反复拦截该标的</tspan></text>
+      </g>
+      <line class="arrow" x1="220" y1="680" x2="220" y2="712" marker-end="url(#arB)"/>
+
+      <!-- 下单 -->
+      <g transform="translate(50,720)">
+        <rect class="node-a" width="340" height="70" rx="10"/>
+        <text x="170" y="32" text-anchor="middle"><tspan x="170">⑥ 下单：买入 fixed_size 股</tspan><tspan x="170" dy="18">价格 = 现价 + price_add</tspan></text>
+      </g>
+      <line class="dash" x1="392" y1="755" x2="512" y2="755"/>
+      <text class="t-label" x="452" y="748" text-anchor="middle">注</text>
+      <g transform="translate(520,720)">
+        <rect class="node-n" width="480" height="70" rx="10"/>
+        <text class="t-note" x="240" y="32" text-anchor="middle"><tspan x="240">T+1：当日买入当天不可卖</tspan><tspan x="240" dy="18">卖出规则最早从次日开始生效</tspan></text>
+      </g>
+      <line class="arrow" x1="220" y1="790" x2="220" y2="822" marker-end="url(#arB)"/>
+
+      <!-- 记账 -->
+      <g transform="translate(50,830)">
+        <rect class="node-a" width="340" height="70" rx="10"/>
+        <text x="170" y="25" text-anchor="middle"><tspan x="170">⑦ 记账</tspan><tspan x="170" dy="18">entered.add · entry_prices = 触发时现价</tspan><tspan x="170" dy="18">max_profit_pct = 0 · surge_count++</tspan></text>
+      </g>
+      <line class="dash" x1="392" y1="865" x2="512" y2="865"/>
+      <text class="t-label" x="452" y="858" text-anchor="middle">注</text>
+      <g transform="translate(520,830)">
+        <rect class="node-n" width="480" height="70" rx="10"/>
+        <text class="t-note" x="240" y="32" text-anchor="middle"><tspan x="240">建仓成交后用实际成交价覆盖 entry_prices</tspan><tspan x="240" dy="18">此后开仓价不再被任何事件改动</tspan></text>
+      </g>
+      <line class="arrow" x1="220" y1="900" x2="220" y2="932" marker-end="url(#arB)"/>
+
+      <!-- 日志 -->
+      <g transform="translate(50,940)">
+        <rect class="node-t" width="340" height="70" rx="10"/>
+        <text x="170" y="32" text-anchor="middle"><tspan x="170">⑧ 日志 + 企业微信</tspan><tspan x="170" dy="18">快速拉升买入 代码(名称) …</tspan></text>
+      </g>
+      <line class="dash" x1="392" y1="975" x2="512" y2="975"/>
+      <text class="t-label" x="452" y="968" text-anchor="middle">注</text>
+      <g transform="translate(520,940)">
+        <rect class="node-n" width="480" height="70" rx="10"/>
+        <text class="t-note" x="240" y="32" text-anchor="middle"><tspan x="240">冷却：亏损离场后记录止损日 D</tspan><tspan x="240" dy="18">D ~ D+COOLDOWN_DAYS 天不再买入该标的</tspan></text>
+      </g>
+    </svg>
+  </div>
+
+  <!-- ==================== 卖出 ==================== -->
+  <div class="card">
+    <h2>二、卖出逻辑</h2>
+    <p class="hint">
+      前置只要求"持仓 &gt; 0 且可卖量 &gt; 0"（T+1 下当日买入可卖量为 0，整条链跳过）。
+      之后按优先级短路：<b>情绪档优先</b>，命中即全清、价格档不跑；否则价格档按 ①→⑤ 取首个命中。
+    </p>
+
+    <svg viewBox="0 0 1040 1360" role="img" aria-label="卖出流程图">
+      <defs>
+        <marker id="arS" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/>
+        </marker>
+      </defs>
+
+      <!-- 起点 -->
+      <g transform="translate(50,40)">
+        <rect class="node-t" width="340" height="70" rx="10"/>
+        <text x="170" y="40" text-anchor="middle">tick 到达（09:30 连续竞价后）</text>
+      </g>
+      <line class="arrow" x1="220" y1="110" x2="220" y2="142" marker-end="url(#arS)"/>
+
+      <!-- 前置 -->
+      <g transform="translate(50,150)">
+        <rect class="node-d" width="340" height="70" rx="10"/>
+        <text x="170" y="32" text-anchor="middle"><tspan x="170">① 持仓 &gt; 0 且 可卖量 &gt; 0？</tspan><tspan x="170" dy="18">可卖量 = 昨仓 − 卖出冻结</tspan></text>
+      </g>
+      <line class="arrow" x1="392" y1="185" x2="512" y2="185" marker-end="url(#arS)"/>
+      <text class="t-label" x="452" y="178" text-anchor="middle">否</text>
+      <g transform="translate(520,150)">
+        <rect class="node" width="480" height="70" rx="10"/>
+        <text x="240" y="40" text-anchor="middle">跳过：当日买入不可卖（T+1）</text>
+      </g>
+      <line class="arrow" x1="220" y1="220" x2="220" y2="252" marker-end="url(#arS)"/>
+
+      <!-- 更新峰值 -->
+      <g transform="translate(50,260)">
+        <rect class="node-a" width="340" height="70" rx="10"/>
+        <text x="170" y="32" text-anchor="middle"><tspan x="170">② 更新历史最大收益率</tspan><tspan x="170" dy="18">max_profit_pct（减半/回撤/保底共用）</tspan></text>
+      </g>
+      <line class="arrow" x1="220" y1="330" x2="220" y2="362" marker-end="url(#arS)"/>
+
+      <!-- 情绪档 -->
+      <g transform="translate(50,370)">
+        <rect class="node-g" width="340" height="90" rx="10"/>
+        <text x="170" y="25" text-anchor="middle"><tspan x="170">③ 情绪档（第一优先级）</tspan><tspan x="170" dy="18">收益 &lt; 3%（含亏损）</tspan><tspan x="170" dy="18">且 行业评级 偏弱 / 极弱</tspan></text>
+      </g>
+      <line class="arrow" x1="392" y1="415" x2="512" y2="415" marker-end="url(#arS)"/>
+      <text class="t-label" x="452" y="408" text-anchor="middle">是</text>
+      <g transform="translate(520,370)">
+        <rect class="node-hit" width="480" height="90" rx="10"/>
+        <text x="240" y="32" text-anchor="middle"><tspan x="240">命中 → 全清（情绪离场），价格档不跑</tspan><tspan x="240" dy="18">行业转弱即走，弱市里亏 0.5% 也走</tspan></text>
+      </g>
+      <line class="arrow" x1="220" y1="460" x2="220" y2="492" marker-end="url(#arS)"/>
+      <text class="t-label" x="205" y="480" text-anchor="end">否</text>
+
+      <!-- 止损 -->
+      <g transform="translate(50,500)">
+        <rect class="node-g" width="340" height="90" rx="10"/>
+        <text x="170" y="25" text-anchor="middle"><tspan x="170">④ 分档止损：亏损 ≥ 当前档位？</tspan><tspan x="170" dy="18">10:00 前 4% ｜ 10:00 后 2%</tspan><tspan x="170" dy="18">情绪档不在岗 → 全天 2% 不放宽</tspan></text>
+      </g>
+      <line class="arrow" x1="392" y1="545" x2="512" y2="545" marker-end="url(#arS)"/>
+      <text class="t-label" x="452" y="538" text-anchor="middle">是</text>
+      <g transform="translate(520,500)">
+        <rect class="node-hit" width="480" height="90" rx="10"/>
+        <text x="240" y="32" text-anchor="middle"><tspan x="240">命中 → 全清（止损）</tspan><tspan x="240" dy="18">reason 标注档位：开盘宽档 / 常规档</tspan></text>
+      </g>
+      <line class="arrow" x1="220" y1="590" x2="220" y2="622" marker-end="url(#arS)"/>
+      <text class="t-label" x="205" y="610" text-anchor="end">否</text>
+
+      <!-- 清仓止盈 -->
+      <g transform="translate(50,630)">
+        <rect class="node-g" width="340" height="70" rx="10"/>
+        <text x="170" y="32" text-anchor="middle"><tspan x="170">⑤ 收益 ≥ clear_profit_pct？</tspan><tspan x="170" dy="18">默认 20%</tspan></text>
+      </g>
+      <line class="arrow" x1="392" y1="665" x2="512" y2="665" marker-end="url(#arS)"/>
+      <text class="t-label" x="452" y="658" text-anchor="middle">是</text>
+      <g transform="translate(520,630)">
+        <rect class="node-hit" width="480" height="70" rx="10"/>
+        <text x="240" y="40" text-anchor="middle">命中 → 全清（清仓止盈）</text>
+      </g>
+      <line class="arrow" x1="220" y1="700" x2="220" y2="732" marker-end="url(#arS)"/>
+      <text class="t-label" x="205" y="720" text-anchor="end">否</text>
+
+      <!-- 减半 -->
+      <g transform="translate(50,740)">
+        <rect class="node-g" width="340" height="70" rx="10"/>
+        <text x="170" y="32" text-anchor="middle"><tspan x="170">⑥ 收益 ≥ half_profit_pct 且未减半？</tspan><tspan x="170" dy="18">默认 10%</tspan></text>
+      </g>
+      <line class="arrow" x1="392" y1="775" x2="512" y2="775" marker-end="url(#arS)"/>
+      <text class="t-label" x="452" y="768" text-anchor="middle">是</text>
+      <g transform="translate(520,740)">
+        <rect class="node-hit" width="480" height="70" rx="10"/>
+        <text x="240" y="32" text-anchor="middle"><tspan x="240">命中 → 卖出半仓（SELL，100 股向上取整）</tspan><tspan x="240" dy="18">取整后 ≥ 全部可卖量则跳过，避免等同清仓</tspan></text>
+      </g>
+      <line class="arrow" x1="220" y1="810" x2="220" y2="842" marker-end="url(#arS)"/>
+      <text class="t-label" x="205" y="830" text-anchor="end">否</text>
+
+      <!-- 回撤 -->
+      <g transform="translate(50,850)">
+        <rect class="node-g" width="340" height="70" rx="10"/>
+        <text x="170" y="32" text-anchor="middle"><tspan x="170">⑦ 最大收益 − 当前收益 ≥ 10%？</tspan><tspan x="170" dy="18">MAX_DRAWDOWN_PCT</tspan></text>
+      </g>
+      <line class="arrow" x1="392" y1="885" x2="512" y2="885" marker-end="url(#arS)"/>
+      <text class="t-label" x="452" y="878" text-anchor="middle">是</text>
+      <g transform="translate(520,850)">
+        <rect class="node-hit" width="480" height="70" rx="10"/>
+        <text x="240" y="40" text-anchor="middle">命中 → 全清（回撤止盈）</text>
+      </g>
+      <line class="arrow" x1="220" y1="920" x2="220" y2="952" marker-end="url(#arS)"/>
+      <text class="t-label" x="205" y="940" text-anchor="end">否</text>
+
+      <!-- 保底 -->
+      <g transform="translate(50,960)">
+        <rect class="node-g" width="340" height="90" rx="10"/>
+        <text x="170" y="25" text-anchor="middle"><tspan x="170">⑧ 当前收益 &lt; 保底线？</tspan><tspan x="170" dy="18">曾涨 ≥10% → 保底 5%</tspan><tspan x="170" dy="18">≥5% → 保底 2% ｜ ≥3% → 保底 0%</tspan></text>
+      </g>
+      <line class="arrow" x1="392" y1="1005" x2="512" y2="1005" marker-end="url(#arS)"/>
+      <text class="t-label" x="452" y="998" text-anchor="middle">是</text>
+      <g transform="translate(520,960)">
+        <rect class="node-hit" width="480" height="90" rx="10"/>
+        <text x="240" y="32" text-anchor="middle"><tspan x="240">命中 → 全清（跌破保底）</tspan><tspan x="240" dy="18">取最高适用档的保底线</tspan></text>
+      </g>
+      <line class="arrow" x1="220" y1="1050" x2="220" y2="1082" marker-end="url(#arS)"/>
+      <text class="t-label" x="205" y="1070" text-anchor="end">否</text>
+
+      <!-- 全部未命中 -->
+      <g transform="translate(50,1090)">
+        <rect class="node-t" width="340" height="70" rx="10"/>
+        <text x="170" y="32" text-anchor="middle"><tspan x="170">⑨ 全部未命中 → 不动</tspan><tspan x="170" dy="18">继续持有，下个 tick 重新判定</tspan></text>
+      </g>
+      <line class="dash" x1="392" y1="1125" x2="512" y2="1125"/>
+      <text class="t-label" x="452" y="1118" text-anchor="middle">注</text>
+      <g transform="translate(520,1090)">
+        <rect class="node-n" width="480" height="70" rx="10"/>
+        <text class="t-note" x="240" y="32" text-anchor="middle"><tspan x="240">③～⑧ 任一档命中 → 统一下单</tspan><tspan x="240" dy="18">再走下方「命中后处理」</tspan></text>
+      </g>
+
+      <!-- 命中后处理 -->
+      <line class="dash" x1="760" y1="1160" x2="760" y2="1196" marker-end="url(#arS)"/>
+      <g transform="translate(50,1200)">
+        <rect class="node-a" width="950" height="120" rx="10"/>
+        <text class="t-title" x="475" y="28" text-anchor="middle">命中后处理（③～⑧ 任一档命中都执行）</text>
+        <text x="22" y="52">① 下单：全清 → 可卖量；减半 → 半仓向上取整到 100 股；价格 = 现价 − price_add</text>
+        <text x="22" y="74">② 日志 + 企业微信：卖出信号 代码(名称) &lt;原因&gt; 卖出价格 … 当前收益 … 最大收益 …（原因里含大盘/行业四项情绪）</text>
+        <text x="22" y="96">③ CLEAR 且亏损 → 记录止损日并立即落盘（冷却）；止盈离场不加冷却</text>
+        <text x="22" y="115">④ 平仓归零 → 清理 entry_prices / max_profit_pct，释放 entered</text>
+      </g>
+    </svg>
+  </div>
+
+  <!-- ==================== 参数 ==================== -->
+  <div class="card">
+    <h2>三、关键参数（当前默认值）</h2>
+    <h3>买入</h3>
+    <table>
+      <tr><th>参数</th><th>值</th><th>说明</th></tr>
+      <tr><td><code>surge_pct</code></td><td>3%</td><td>拉升阈值，窗口与昨收两条都用它</td></tr>
+      <tr><td><code>surge_window</code> / <code>MIN_SURGE_SPAN</code></td><td>300s / 180s</td><td>窗口长度 / 窗口至少要覆盖的时长</td></tr>
+      <tr><td><code>fixed_size</code> / <code>price_add</code></td><td>500 / 0.0</td><td>开仓股数 / 报价加点</td></tr>
+      <tr><td><code>REFRESH_TIME</code> / <code>MARKET_OPEN_TIME</code></td><td>09:15 / 09:30</td><td>刷新标的池时刻 / 开始判定的时刻</td></tr>
+    </table>
+
+    <h3>卖出</h3>
+    <table>
+      <tr><th>参数</th><th>值</th><th>说明</th></tr>
+      <tr><td><code>WIDE_STOP_LOSS_PCT</code> / <code>WIDE_STOP_END_TIME</code></td><td>4% / 10:00</td><td>开盘宽档止损及其截止时刻</td></tr>
+      <tr><td><code>STOP_LOSS_PCT</code></td><td>2%</td><td>常规档止损；情绪档不在岗时全天用它</td></tr>
+      <tr><td><code>clear_profit_pct</code> / <code>half_profit_pct</code></td><td>20% / 10%</td><td>清仓止盈 / 减半止盈</td></tr>
+      <tr><td><code>MAX_DRAWDOWN_PCT</code></td><td>10%</td><td>相对历史最大收益的回撤上限</td></tr>
+      <tr><td><code>TIER_HIGH_PCT</code> / <code>TIER_LOW_PCT</code> / <code>TIER_BREAKEVEN_PCT</code></td><td>10% / 5% / 3%</td><td>保底分档触发线（对应保底 5% / 2% / 0%）</td></tr>
+      <tr><td><code>COOLDOWN_DAYS</code></td><td>2</td><td>亏损离场后记录止损日 D，D ~ D+2 天不再买入该标的</td></tr>
+    </table>
+
+    <h3>情绪数据（vnpy_marketsentiment）</h3>
+    <table>
+      <tr><th>项目</th><th>说明</th></tr>
+      <tr><td>综合分分级</td><td>&lt;20 极弱 ｜ &lt;45 偏弱 ｜ &lt;60 中性 ｜ &lt;80 偏强 ｜ ≥80 极强</td></tr>
+      <tr><td>数据的含义</td><td>行业分 = 成分股<b>当日相对昨收</b>的涨跌宽度合成，因此"行业偏弱"≈"今天这个行业整体在跌"</td></tr>
+      <tr><td>刷新与降级</td><td>盘中约 30s 采样一次；距上次刷新超 90s 视为 <code>stale</code>，判定层不信任</td></tr>
+      <tr><td>降级原则</td><td>行业数据不可用 / 个股未分行业 → 情绪档不触发、买入不通过；大盘数据不可信 → 买入按严格档、止损按常规档 2%（绝不放宽）</td></tr>
+      <tr><td><b>消息必带四项</b></td><td>买入与卖出的每条日志 / 企微消息都带：<b>大盘评级 · 大盘情绪分 · 行业评级 · 行业情绪分</b>（缺数据时以“不可用” / “-” 占位，不留空），由 <code>format_sentiment_context()</code> 统一拼装</td></tr>
+    </table>
+  </div>
+
+  <!-- ==================== 约束 ==================== -->
+  <div class="card">
+    <h2>四、两条贯穿全程的约束</h2>
+    <h3>1. T+1：首日不可卖</h3>
+    <p class="hint" style="margin-bottom:10px">
+      当日买入的仓位可卖量为 0，整条卖出链跳过，引擎 <code>check_t1_order</code> 还会兜底拒单。
+      所以所有卖出规则最早从<b>次日</b>生效，止监管不了第一天的下跌与隔夜跳空 ——
+      首日敞口只能靠买入端（买不买、买多少）控制。
+    </p>
+    <h3>2. 亏损离场的冷却期</h3>
+    <p class="hint" style="margin-bottom:0">
+      清仓且亏损时记录<b>止损日</b>到 <code>cooldown_dates</code>（随
+      <code>portfolio_strategy_data.json</code> 持久化，重启不丢），止损日起
+      <code>COOLDOWN_DAYS</code> 个自然日内不再买入该标的，用来堵住 T+1 下
+      "清仓 → 当天买回 → 次日再清" 的日频循环。止盈离场不加冷却。
+    </p>
+  </div>
+
+  <div class="card">
+    <h2>五、Mermaid 源码（便于贴到其他工具重绘）</h2>
+    <details>
+      <summary>展开 / 收起</summary>
+      <pre>flowchart TD
+    T([tick 到达]) --&gt; P{已持仓?}
+    P --&gt;|是| SELL[[走卖出流程]]
+    P --&gt;|否| U{在当日标的池?}
+    U --&gt;|否| X1[忽略]
+    U --&gt;|是| G{前置: 未触发过 &amp; 非冷却期 &amp; 价格有效?}
+    G --&gt;|否| X2[忽略]
+    G --&gt;|是| S{拉升: 窗口涨幅>=3% 或 昨收涨幅>=3%}
+    S --&gt;|否| X3[本轮无操作]
+    S --&gt;|是| M{情绪准入: 大盘分档}
+    M --&gt;|大盘偏强/极强: 行业需中性及以上<br/>否则: 行业需偏强/极强| O[买入 fixed_size]
+    M --&gt;|不通过| X4[拦截: 日志+企微, 当日不再买]
+
+    subgraph 卖出链 [卖出链: 优先级短路]
+      Q{持仓>0 且 可卖量>0} --&gt;|否| Y0[跳过: 当日买入不可卖]
+      Q --&gt;|是| E{情绪档: 收益&lt;3% 且 行业偏弱/极弱}
+      E --&gt;|是| C1[全清: 情绪离场]
+      E --&gt;|否| L1{亏损>=档位: 10点前4% / 10点后2%}
+      L1 --&gt;|是| C2[全清: 止损]
+      L1 --&gt;|否| L2{收益>=20%}
+      L2 --&gt;|是| C3[全清: 清仓止盈]
+      L2 --&gt;|否| L3{收益>=10% 且未减半}
+      L3 --&gt;|是| C4[卖一半]
+      L3 --&gt;|否| L4{回撤>=10%}
+      L4 --&gt;|是| C5[全清: 回撤止盈]
+      L4 --&gt;|否| L5{跌破保底线}
+      L5 --&gt;|是| C6[全清: 跌破保底]
+      L5 --&gt;|否| H[继续持有]
+    end
+    C1 --&gt; R{清仓且亏损?}
+    C2 --&gt; R
+    R --&gt;|是| CO[记录止损日, COOLDOWN_DAYS 天内不再买入]</pre>
+    </details>
+  </div>
+
+  <p class="foot">NearMaSurgeStrategy · 买入 / 卖出逻辑梳理 · 与代码同步维护</p>
+</div>
+</body>
+</html>
