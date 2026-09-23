@@ -7,7 +7,7 @@ from bigqmt_signal_trader.xtquant_compat import xtdata
 
 from vnpy_sqlapp import APP_NAME as SQLAPP_NAME
 
-from vnpy_portfoliostrategy import StrategyTemplate, StrategyEngine
+from vnpy_portfoliostrategy import OrderMonitor, StrategyTemplate, StrategyEngine
 from vnpy_portfoliostrategy.signals import (
     SignalResult,
     SignalType,
@@ -45,6 +45,12 @@ class NearMaSurgeStrategy(StrategyTemplate):
     内部按 ``vt_symbol`` 维护子信号映射并分发行情；子信号经 ``signal_result()`` 返回
     ``SignalResult``（type=买入/卖出/清仓 + 数量 + 价格 + 原因），策略据此下单。
     需持久化的全局状态（开仓价/最大收益/标的池等）仍由策略持有，子信号经引用访问。
+
+    卖单发出后会纳入**卖出委托监控**（通用件 ``OrderMonitor``，见 ``order_monitor``
+    模块）：全部成交/撤单/拒单即去掉监控；挂满 ``SELL_ORDER_TIMEOUT``（默认 5 分钟）
+    仍未全部成交则企微告警并撤单，**不重发**（撤单释放的 T+1 冻结量会让可卖量恢复，
+    若卖出条件仍成立，卖出信号会在后续 tick 自然重新下单）。监控状态仅存活在进程内，
+    不持久化。
     """
 
     author: str = "用Python的交易员"
@@ -58,6 +64,10 @@ class NearMaSurgeStrategy(StrategyTemplate):
     price_add: float = 0.0
     # T+1 开关（A 股现货 True：仅可卖昨仓；期货 False：T+0）
     t1: bool = True
+
+    # 卖出委托监控：卖单发出后跟踪成交；全部成交/撤单/拒单即去掉监控，
+    # 挂满 SELL_ORDER_TIMEOUT 仍未全部成交则企微告警并撤单，**不重发**
+    SELL_ORDER_TIMEOUT: float = 300.0    # 秒（默认 5 分钟），作为 OrderMonitor 的 timeout
 
     # 快速拉升检测参数
     surge_pct: float = 0.03
@@ -136,6 +146,13 @@ class NearMaSurgeStrategy(StrategyTemplate):
 
         # 本轮已触发买入的标的，避免同一波拉升重复下单（含行业拦截也标记）
         self.entered: set[str] = set()
+
+        # 卖出委托监控（通用件，仅运行时状态，不持久化）：全部成交/撤单/拒单即摘除，
+        # 超时未全部成交则告警并撤单（不重发）。label="卖出" 让告警文案为
+        # "卖出委托超时告警 …"
+        self.sell_monitor: OrderMonitor = OrderMonitor(
+            self, timeout=self.SELL_ORDER_TIMEOUT, label="卖出"
+        )
 
         # 亏损离场后的买入冷却：vt_symbol -> 止损离场日（YYYYMMDD，持久化，重启不丢）
         self.cooldown_dates: dict[str, str] = {}
@@ -299,10 +316,13 @@ class NearMaSurgeStrategy(StrategyTemplate):
         if not self._is_trading_session(tick):
             return
 
+        # 2. 卖出委托监控：挂满 SELL_ORDER_TIMEOUT 仍未全部成交则告警并撤单
+        self.sell_monitor.check()
+
         vt_symbol: str = tick.vt_symbol
         pos: int = self.get_pos(vt_symbol)
 
-        # 2. 有持仓且可卖量 > 0 才走卖出分支（情绪卖出 / 止损 / 移动止盈 / 分档止盈）
+        # 3. 有持仓且可卖量 > 0 才走卖出分支（情绪卖出 / 止损 / 移动止盈 / 分档止盈）
         if pos > 0:
             sellable: int = self.get_sellable(vt_symbol)
             if sellable > 0:
@@ -311,7 +331,12 @@ class NearMaSurgeStrategy(StrategyTemplate):
                 self.sell_signal.on_tick(tick)
                 result: SignalResult = self.sell_signal.signal_result(vt_symbol)
                 if result.type in (SignalType.SELL, SignalType.CLEAR) and result.volume > 0:
-                    self.sell(vt_symbol, result.price, result.volume, mark=result.reason)
+                    vt_orderids: list[str] = self.sell(
+                        vt_symbol, result.price, result.volume, mark=result.reason
+                    )
+                    self.sell_monitor.track(
+                        vt_orderids, vt_symbol, mark=result.reason
+                    )
                     msg: str = self._fmt_sell_msg(vt_symbol, tick, result)
                     self.write_log(msg)
                     self.send_wecom(msg)
@@ -324,7 +349,7 @@ class NearMaSurgeStrategy(StrategyTemplate):
                         )
             return
 
-        # 3. 无持仓标的走买入分支：仅当日池内标的才做拉升检测（总信号维护窗口 +
+        # 4. 无持仓标的走买入分支：仅当日池内标的才做拉升检测（总信号维护窗口 +
         #    拉升判定 + 行业过滤）；非池内标的不创建子信号，避免无谓采样与残留
         if vt_symbol not in self.target_symbols:
             return
@@ -441,8 +466,11 @@ class NearMaSurgeStrategy(StrategyTemplate):
         )
 
     def update_order(self, order: OrderData) -> None:
-        """委托数据更新：仅在关键状态变化时推送企业微信通知"""
+        """委托数据更新：维护卖出委托监控，并推送关键状态通知"""
         super().update_order(order)
+
+        # 委托终结（全部成交/撤单/拒单）即去掉卖出委托监控
+        self.sell_monitor.update_order(order)
 
         # 过滤 SUBMITTING/NOTTRADED 等中间状态噪声
         if order.status not in {

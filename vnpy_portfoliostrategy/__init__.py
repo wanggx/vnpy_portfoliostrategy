@@ -32,6 +32,7 @@ from .base import APP_NAME
 from .engine import StrategyEngine
 from .template import StrategyTemplate
 from .backtesting import BacktestingEngine
+from .order_monitor import OrderMonitor, OrderRecord
 
 
 __all__ = [
@@ -39,6 +40,8 @@ __all__ = [
     "StrategyEngine",
     "StrategyTemplate",
     "BacktestingEngine",
+    "OrderMonitor",
+    "OrderRecord",
     "Direction",
     "TickData",
     "BarData",

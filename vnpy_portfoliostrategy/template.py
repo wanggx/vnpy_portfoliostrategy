@@ -356,7 +356,7 @@ class StrategyTemplate(ABC):
         """查询委托数据"""
         return self.orders.get(vt_orderid, None)
 
-    def get_all_active_orderids(self) -> list[OrderData]:
+    def get_all_active_orderids(self) -> list[str]:
         """获取全部活动状态的委托号"""
         return list(self.active_orderids)
 
