@@ -6,8 +6,10 @@
    任一命中即产出 BUY 意向（不含行业评级）：
    - ``WindowSurgeSubSignal``：维护价格窗口，窗口内相对最低价涨幅 >= surge_pct 命中。
    - ``DayGainSubSignal``：相对昨收涨幅 >= surge_pct 命中。
-2. ``SectorBuySubSignal``（链次）：前序有 BUY 意向才查行业情绪；评级中性及以上则保留 BUY
-   并补行业评级进 reason；否则记拦截日志/企微 + entered.add，否定为 NONE（短路后续子信号）。
+2. ``SectorBuySubSignal``（链次）：前序有 BUY 意向才查大盘 + 行业情绪；大盘评级中性以上时
+   行业需中性及以上，大盘评级中性及以下（含大盘快照不可用）时行业需中性以上（不含中性）。
+   达标则保留 BUY 并把大盘 / 行业评级补进 reason；否则记拦截日志/企微 + entered.add，
+   否定为 NONE（短路后续子信号）。
 
 需要持久化的全局状态（``entered`` 去重集合、标的池）经 ``self.strategy`` 访问；
 子信号只持有价格窗口、行业判定器实例等运行时状态。
@@ -191,12 +193,13 @@ class SurgeBuyOrSignal(OrCompositeSubSignal):
 
 
 class SectorBuySubSignal(SubSignal):
-    """单标的行业过滤子信号（链次）：前序有 BUY 意向才查行业。
+    """单标的行业过滤子信号（链次）：前序有 BUY 意向才查大盘 + 行业。
 
-    ``on_tick`` 见 ``prev`` 为 BUY 才查所属行业情绪：评级中性及以上则保留 BUY 并补行业
-    评级进 reason；否则记拦截日志/企微 + ``entered.add``，否定为 NONE（短路后续子信号）。
-    ``prev`` 非 BUY 时直接返回 NONE（不查行业，避免每 tick 刷屏）。复用 ``SectorBuySignal``
-    做行业评级判定。
+    ``on_tick`` 见 ``prev`` 为 BUY 才查大盘与所属行业情绪：大盘评级中性以上时行业需中性及
+    以上、大盘评级中性及以下（含大盘快照不可用）时行业需中性以上，达标则保留 BUY 并把大盘 /
+    行业评级补进 reason；否则记拦截日志/企微 + ``entered.add``，否定为 NONE（短路后续子信号）。
+    ``prev`` 非 BUY 时直接返回 NONE（不查情绪，避免每 tick 刷屏）。复用 ``SectorBuySignal``
+    做大盘 + 行业评级判定。
     """
 
     def __init__(self, vt_symbol: str, strategy: StrategyTemplate) -> None:
@@ -206,8 +209,8 @@ class SectorBuySubSignal(SubSignal):
         self._result: SignalResult = SignalResult()
 
     def on_tick(self, tick: TickData, prev: SignalResult) -> SignalResult:
-        """前序有 BUY 意向才查行业；不可买则拦截+否定，可买则保留并补评级。"""
-        # 前序无买入意向，不查行业（短路：避免每 tick 刷屏）
+        """前序有 BUY 意向才查大盘+行业；不可买则拦截+否定，可买则保留并补评级。"""
+        # 前序无买入意向，不查大盘/行业（短路：避免每 tick 刷屏）
         if prev.type != SignalType.BUY:
             self._result = SignalResult()
             return self._result
@@ -222,8 +225,11 @@ class SectorBuySubSignal(SubSignal):
             skip_msg: str = (
                 f"行业情绪拦截 {self.vt_symbol}({name}) "
                 f"买入价格 {buy_price:.2f} "
-                f"行业 {sector_result.sector_name} 得分 {sector_result.sector_score:.1f} "
-                f"评级 {sector_result.sector_level}，未达中性以上，不买入"
+                f"大盘 评级 {sector_result.market_level} "
+                f"得分 {sector_result.market_score:.1f} "
+                f"行业 {sector_result.sector_name} "
+                f"评级 {sector_result.sector_level} "
+                f"得分 {sector_result.sector_score:.1f}，未达准入，不买入"
             )
             s.write_log(skip_msg)
             s.send_wecom(skip_msg)
@@ -233,15 +239,18 @@ class SectorBuySubSignal(SubSignal):
             self._result = SignalResult()
             return self._result
 
-        # 可买：保留 prev 的 BUY，并补行业评级进 reason
+        # 可买：保留 prev 的 BUY，并补大盘/行业评级进 reason
         self._result = SignalResult(
             type=prev.type,
             volume=prev.volume,
             price=prev.price,
             reason=(
                 f"{prev.reason} "
-                f"行业 {sector_result.sector_name} 得分 {sector_result.sector_score:.1f} "
-                f"评级 {sector_result.sector_level}"
+                f"大盘 评级 {sector_result.market_level} "
+                f"得分 {sector_result.market_score:.1f} "
+                f"行业 {sector_result.sector_name} "
+                f"评级 {sector_result.sector_level} "
+                f"得分 {sector_result.sector_score:.1f}"
             ),
         )
         return self._result

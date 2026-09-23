@@ -3,7 +3,7 @@
 统一两层信号架构：
 - ``base``：``SignalType`` / ``SignalResult`` / ``SubSignal`` / ``SignalAggregator``
 - ``buy_signals``：``WindowSurgeSubSignal`` / ``DayGainSubSignal`` / ``SurgeBuyOrSignal`` /
-  ``SectorBuySubSignal`` / ``BuyAggregator``（拉升检测 OR + 行业情绪过滤）
+  ``SectorBuySubSignal`` / ``BuyAggregator``（拉升检测 OR + 大盘/行业情绪过滤）
 - ``sell_signals``：``SectorSellSubSignal`` / ``PriceSellSubSignal`` /
   ``PriorityCompositeSubSignal`` / ``SellSubSignal`` / ``SellAggregator``
   （情绪卖出优先 + 价格卖出，优先级短路）

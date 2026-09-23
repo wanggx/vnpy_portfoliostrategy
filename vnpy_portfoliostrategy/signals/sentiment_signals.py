@@ -5,7 +5,9 @@
 ``MarketSentimentEngine`` 的只读快照取数，与 CTA 引擎解耦。
 
 两个信号器：
-- ``SectorBuySignal``：根据标的所属申万二级行业的情绪分，判断是否可买入。
+- ``SectorBuySignal``：结合大盘（全市场综合）情绪与标的所属申万二级行业情绪分，判断
+  是否可买入。大盘评级中性以上时行业需中性及以上；大盘评级中性及以下时行业需中性以上
+  （不含中性）。
 - ``MarketRiskOffSignal``：根据全市场综合情绪分，判断是否需要全部清仓。
 
 另含卖出侧的行业判定器：
@@ -13,7 +15,8 @@
   （评级中性以下）。与 ``SectorBuySignal`` 对称，各自独立的结果类型与判定器。
 
 降级原则（缺数据时偏保守）：
-- 买入信号：情绪 App 未加载 / 标的未映射到行业 / 快照不可用 → 不买入。
+- 买入信号：情绪 App 未加载 / 标的未映射到行业 / 行业有效家数不足 → 不买入；
+  大盘快照不可用（未加载 / 过期 / 有效标的不足）→ 按中性及以下处理，行业需中性以上。
 - 清仓信号：情绪 App 未加载 / 快照不可用或过期 → 不触发清仓。
 
 注意：``_evaluate`` 内的准确判断逻辑暂为占位实现（无干预），待业务规则确定后填入。
@@ -59,6 +62,9 @@ class SectorBuyResult:
     ``sector_level`` 标注降级原因（如 "不可用" / "未分行业"）。
     ``below_neutral`` 表示行业评级是否严格在中性以下（偏弱 / 极弱），
     降级（不可用 / 未分行业 / 未映射）时为 False，供策略据此离场而非误判。
+    ``market_level`` / ``market_score`` 为大盘情绪快照的评级与得分，用于确定行业
+    准入档位并供策略展示；大盘快照不可用（过期 / 有效标的不足）时仍带上快照自带
+    评级，但判定已按中性及以下的严格档处理。
     """
 
     buyable: bool
@@ -66,6 +72,8 @@ class SectorBuyResult:
     sector_score: float = 0.0
     sector_level: str = ""
     below_neutral: bool = False
+    market_level: str = ""
+    market_score: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,15 +173,26 @@ class SentimentSignal:
 
 
 class SectorBuySignal(SentimentSignal):
-    """行业可买信号器：判断标的所属申万二级行业情绪是否允许买入。
+    """行业可买信号器：结合大盘情绪判断标的所属申万二级行业是否允许买入。
 
-    规则：行业评级在中性（NEUTRAL）及以上（偏强 / 极强）时允许买入，
-    其余（偏弱 / 极弱 / 不可用 / 未分行业）一律不买。阈值写死，不暴露为策略参数。
+    行业准入档位随大盘（全市场综合）情绪评级分档：
+    - 大盘评级在中性以上（偏强 / 极强）：行业评级中性及以上（中性 / 偏强 / 极强）即可买入；
+    - 大盘评级在中性及以下（中性 / 偏弱 / 极弱）：行业评级需中性以上（不含中性）；
+    - 大盘快照不可用（未加载 / 过期 / 有效标的不足）：按中性及以下处理，走严格档。
+
+    其余（行业偏弱 / 极弱 / 不可用 / 未分行业）一律不买。阈值写死，不暴露为策略参数。
     """
 
-    # 允许买入的评级集合：中性及以上
+    # 中性及以上的评级集合：中性 / 偏强 / 极强（大盘中性以上时的行业准入档）
     BUYABLE_LEVELS: set = {
         SentimentLevel.NEUTRAL,
+        SentimentLevel.BULLISH,
+        SentimentLevel.EXTREME_BULLISH,
+    } if SentimentLevel is not None else set()
+
+    # 中性以上（不包含中性）的评级集合：偏强 / 极强
+    # （大盘中性及以下时的行业准入档，也是判断大盘强弱的分界）
+    ABOVE_NEUTRAL_LEVELS: set = {
         SentimentLevel.BULLISH,
         SentimentLevel.EXTREME_BULLISH,
     } if SentimentLevel is not None else set()
@@ -190,6 +209,10 @@ class SectorBuySignal(SentimentSignal):
         self.sector_name: str = ""
         self.sector_score: float = 0.0
         self.sector_level: str = ""
+        # 大盘情绪快照可观测变量，供策略展示/日志
+        self.market_level: str = ""
+        self.market_score: float = 0.0
+        self.market_stale: bool = False
         # 当前判定的标的，由 on_tick / on_bar 维护，is_buyable 不传参时取它
         self.vt_symbol: str = ""
 
@@ -207,8 +230,9 @@ class SectorBuySignal(SentimentSignal):
         """行业情绪是否允许买入该标的。
 
         ``vt_symbol`` 未传时，取最近一次 ``on_tick`` / ``on_bar`` 推送的标的。
-        返回 ``SectorBuyResult``，含 buyable / 行业名 / 得分 / 评级。
-        降级原则：引擎不可用、标的未映射到行业、行业有效家数不足 → buyable=False。
+        返回 ``SectorBuyResult``，含 buyable / 行业名 / 得分 / 评级 / 大盘评级与得分。
+        降级原则：引擎不可用、标的未映射到行业、行业有效家数不足 → buyable=False；
+        大盘快照不可用（过期 / 有效标的不足）→ 按中性及以下收紧为严格档（行业需中性以上）。
         """
         if vt_symbol is None:
             vt_symbol = self.vt_symbol
@@ -233,11 +257,17 @@ class SectorBuySignal(SentimentSignal):
             self.sector_score = 0.0
             self.sector_level = "未分行业"
             return SectorBuyResult(False, "", 0.0, "未分行业", False)
+        # 大盘情绪快照：决定行业准入档位。不可用（过期 / 有效标的不足）时按中性及以下
+        # 处理，即走严格档（行业需中性以上），符合缺数据偏保守的降级原则
+        snapshot: MarketSentimentSnapshot = engine.get_latest()
+        self.market_level = snapshot.level.value
+        self.market_score = snapshot.score
+        self.market_stale = snapshot.stale
         # 更新可观测变量
         self.sector_name = state.name
         self.sector_score = state.score
         self.sector_level = state.level.value
-        buyable: bool = self._evaluate(state)
+        buyable: bool = self._evaluate(state, snapshot)
         below_neutral: bool = state.level in self.BELOW_NEUTRAL_LEVELS
         return SectorBuyResult(
             buyable,
@@ -245,11 +275,20 @@ class SectorBuySignal(SentimentSignal):
             state.score,
             state.level.value,
             below_neutral,
+            self.market_level,
+            self.market_score,
         )
 
-    def _evaluate(self, state: SectorState) -> bool:
-        """行业情绪是否允许买入：评级在中性及以上放行。"""
-        return state.level in self.BUYABLE_LEVELS
+    def _evaluate(self, state: SectorState, snapshot: MarketSentimentSnapshot) -> bool:
+        """行业情绪是否允许买入：按大盘情绪分档收紧行业准入。
+
+        大盘快照可用且评级在中性以上（偏强 / 极强）：行业中性及以上即放行；
+        大盘评级在中性及以下（中性 / 偏弱 / 极弱）或快照不可用：行业需中性以上
+        （不含中性，仅偏强 / 极强）。
+        """
+        if snapshot.available and snapshot.level in self.ABOVE_NEUTRAL_LEVELS:
+            return state.level in self.BUYABLE_LEVELS
+        return state.level in self.ABOVE_NEUTRAL_LEVELS
 
 
 class SectorSellSignal(SentimentSignal):

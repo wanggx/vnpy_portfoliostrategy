@@ -75,7 +75,9 @@ class SectorSellSubSignal(SubSignal):
                 volume=sellable,
                 price=tick.last_price - s.price_add,
                 reason=(
-                    f"行业情绪{sector_result.sector_level} "
+                    f"行业情绪 {sector_result.sector_name} "
+                    f"得分 {sector_result.sector_score:.1f} "
+                    f"评级 {sector_result.sector_level} "
                     f"收益{profit_pct * 100:.2f}% "
                     f"低于{s.TIER_BREAKEVEN_PCT * 100:.0f}% 中性以下离场"
                 ),
