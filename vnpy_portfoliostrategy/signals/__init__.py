@@ -6,7 +6,7 @@
   ``SectorBuySubSignal`` / ``BuyAggregator``（拉升检测 OR + 大盘/行业情绪过滤）
 - ``sell_signals``：``SectorSellSubSignal`` / ``PriceSellSubSignal`` /
   ``PriorityCompositeSubSignal`` / ``SellSubSignal`` / ``SellAggregator``
-  （情绪卖出优先 + 价格卖出，优先级短路）
+  （情绪卖出优先 + 分档价格卖出，优先级短路）
 - ``sentiment_signals``：``SectorBuySignal`` / ``SectorSellSignal`` / ``MarketRiskOffSignal``
   （行业可买 / 行业应卖 / 市场情绪共享依赖）
 """
@@ -39,6 +39,7 @@ from .sentiment_signals import (
     SectorSellResult,
     SectorSellSignal,
     SentimentSignal,
+    format_sentiment_context,
 )
 
 __all__ = [
@@ -67,4 +68,5 @@ __all__ = [
     "SectorSellSignal",
     "SectorSellResult",
     "MarketRiskOffSignal",
+    "format_sentiment_context",
 ]

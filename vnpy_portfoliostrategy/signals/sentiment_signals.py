@@ -17,6 +17,8 @@
 降级原则（缺数据时偏保守）：
 - 买入信号：情绪 App 未加载 / 标的未映射到行业 / 行业有效家数不足 → 不买入；
   大盘快照不可用（未加载 / 过期 / 有效标的不足）→ 按中性及以下处理，行业需中性以上。
+- 卖出信号：行业快照不可信 → 情绪卖出不触发；大盘快照不可信 → 价格档止损不得放宽，
+  全天按常规档（详见 ``sell_signals``）。
 - 清仓信号：情绪 App 未加载 / 快照不可用或过期 → 不触发清仓。
 
 注意：``_evaluate`` 内的准确判断逻辑暂为占位实现（无干预），待业务规则确定后填入。
@@ -51,6 +53,25 @@ _QMT_SUFFIX_BY_EXCHANGE_VALUE: dict[str, str] = {
     Exchange.SZSE.value: ".SZ",
     Exchange.BSE.value: ".BJ",
 }
+
+
+def format_sentiment_context(
+    market_level: str,
+    market_score: float,
+    sector_name: str,
+    sector_level: str,
+    sector_score: float,
+) -> str:
+    """拼装"大盘 + 行业"情绪上下文，买入/卖出消息统一使用。
+
+    四项必备：大盘评级、大盘情绪分、行业评级、行业情绪分。缺数据的字段以
+    "不可用" / "-" 占位而不是留空，保证消息可读、可排查。
+    """
+    return (
+        f"大盘 评级 {market_level or '不可用'} 得分 {market_score:.1f} "
+        f"行业 {sector_name or '-'} 评级 {sector_level or '不可用'} "
+        f"得分 {sector_score:.1f}"
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,6 +175,33 @@ class SentimentSignal:
             return None
         return engine
 
+    def _resolve_engine(self):
+        """取市场情绪引擎（静默版）：缺失时返回 None，不写日志。
+
+        供只问一句"情绪数据在不在"的调用方使用（如价格档据大盘快照可用性决定是否
+        放宽止损），避免每个持仓标的各刷一条同样的降级日志。
+        """
+        if self.main_engine is None or get_sentiment_engine is None:
+            return None
+        return get_sentiment_engine(self.main_engine)
+
+    def market_snapshot(self) -> MarketSentimentSnapshot | None:
+        """取大盘情绪快照（静默）；引擎未加载时返回 None。"""
+        engine = self._resolve_engine()
+        if engine is None:
+            return None
+        return engine.get_latest()
+
+    def snapshot_available(self) -> bool:
+        """大盘情绪快照是否可信（引擎已加载、非过期、有效标的充足）。
+
+        价格档据此决定情绪档是否在岗：不可信时情绪档不触发，价格档不得放宽。
+        """
+        engine = self._resolve_engine()
+        if engine is None:
+            return False
+        return bool(engine.get_latest().available)
+
     @staticmethod
     def _vt_to_qmt(vt_symbol: str) -> str:
         """vnpy vt_symbol（如 600000.SSE）转 QMT 代码（如 600000.SH）。
@@ -236,33 +284,40 @@ class SectorBuySignal(SentimentSignal):
         """
         if vt_symbol is None:
             vt_symbol = self.vt_symbol
+        engine = self._get_engine()
+        if engine is None:
+            return SectorBuyResult(False, "", 0.0, "不可用", False, "不可用", 0.0)
+        # 大盘情绪快照先行：与个股行业映射无关，任何降级路径都要带上，
+        # 保证拦截/放行消息里大盘评级与分数始终有值
+        snapshot: MarketSentimentSnapshot = engine.get_latest()
+        self.market_level = snapshot.level.value
+        self.market_score = snapshot.score
+        self.market_stale = snapshot.stale
+
         if not vt_symbol:
             self.sector_name = ""
             self.sector_score = 0.0
             self.sector_level = ""
-            return SectorBuyResult(False, "", 0.0, "", False)
-        engine = self._get_engine()
-        if engine is None:
-            return SectorBuyResult(False, "", 0.0, "不可用", False)
+            return SectorBuyResult(
+                False, "", 0.0, "", False, self.market_level, self.market_score
+            )
         qmt_symbol: str = self._vt_to_qmt(vt_symbol)
         if not qmt_symbol:
             self.sector_name = ""
             self.sector_score = 0.0
             self.sector_level = ""
-            return SectorBuyResult(False, "", 0.0, "", False)
+            return SectorBuyResult(
+                False, "", 0.0, "", False, self.market_level, self.market_score
+            )
         state = engine.get_stock_sector(qmt_symbol)
         if state is None:
             # 未分到行业或该行业有效家数不够，保守不买
             self.sector_name = ""
             self.sector_score = 0.0
             self.sector_level = "未分行业"
-            return SectorBuyResult(False, "", 0.0, "未分行业", False)
-        # 大盘情绪快照：决定行业准入档位。不可用（过期 / 有效标的不足）时按中性及以下
-        # 处理，即走严格档（行业需中性以上），符合缺数据偏保守的降级原则
-        snapshot: MarketSentimentSnapshot = engine.get_latest()
-        self.market_level = snapshot.level.value
-        self.market_score = snapshot.score
-        self.market_stale = snapshot.stale
+            return SectorBuyResult(
+                False, "", 0.0, "未分行业", False, self.market_level, self.market_score
+            )
         # 更新可观测变量
         self.sector_name = state.name
         self.sector_score = state.score
@@ -367,6 +422,43 @@ class SectorSellSignal(SentimentSignal):
             state.level.value,
         )
 
+    def sector_values(self, vt_symbol: str | None = None) -> tuple[str, str, float]:
+        """行业名 / 评级 / 分数（静默取值，供消息拼装）。
+
+        与 ``is_sellable`` 的区别：不做"是否应卖"判定、不写降级日志；取不到时
+        行业名为空串、评级为降级原因（"不可用" / "未分行业"）、分数为 0.0。
+        """
+        if vt_symbol is None:
+            vt_symbol = self.vt_symbol
+        engine = self._resolve_engine()
+        if not vt_symbol or engine is None:
+            return "", "不可用", 0.0
+        qmt_symbol: str = self._vt_to_qmt(vt_symbol)
+        if not qmt_symbol:
+            return "", "不可用", 0.0
+        state = engine.get_stock_sector(qmt_symbol)
+        if state is None:
+            return "", "未分行业", 0.0
+        return state.name, state.level.value, state.score
+
+    def is_usable(self, vt_symbol: str | None = None) -> bool:
+        """该标的的行业情绪是否可用（引擎已加载、代码可映射、行业有有效家数）。
+
+        供价格档判断"情绪档是否在岗"：不可用时情绪档永远不会触发，价格档就不该
+        放宽。走静默取引擎路径，不写降级日志，避免每个持仓标的各刷一条。
+        """
+        if vt_symbol is None:
+            vt_symbol = self.vt_symbol
+        if not vt_symbol:
+            return False
+        engine = self._resolve_engine()
+        if engine is None:
+            return False
+        qmt_symbol: str = self._vt_to_qmt(vt_symbol)
+        if not qmt_symbol:
+            return False
+        return engine.get_stock_sector(qmt_symbol) is not None
+
     def _evaluate(self, state: SectorState) -> bool:
         """行业情绪是否应卖出离场：评级在中性以下（偏弱 / 极弱）触发。"""
         return state.level in self.SELLABLE_LEVELS
@@ -387,6 +479,17 @@ class MarketRiskOffSignal(SentimentSignal):
         self.market_score: float = 0.0
         self.market_level: str = ""
         self.market_stale: bool = False
+
+    def market_values(self) -> tuple[str, float]:
+        """大盘评级与情绪分（静默），供买卖消息拼装。
+
+        与 ``is_risk_off`` 的区别：不做清仓判定、不写降级日志；引擎未加载或快照
+        不可用时返回 (快照自带评级或 "不可用", 分数)。
+        """
+        snapshot: MarketSentimentSnapshot | None = self.market_snapshot()
+        if snapshot is None:
+            return "不可用", 0.0
+        return snapshot.level.value, snapshot.score
 
     def is_risk_off(self) -> bool:
         """市场情绪是否差到需要全部清仓。

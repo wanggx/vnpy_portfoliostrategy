@@ -24,14 +24,14 @@ from typing import TYPE_CHECKING
 from vnpy.trader.object import BarData, TickData
 
 from .base import SignalAggregator, SignalResult, SignalType, SubSignal
-from .sentiment_signals import SectorBuySignal
+from .sentiment_signals import SectorBuySignal, format_sentiment_context
 
 if TYPE_CHECKING:
     from vnpy_portfoliostrategy.template import StrategyTemplate
 
 
 def _check_buyable_context(s, vt_symbol: str, tick: TickData) -> bool:
-    """买入检测公共前置：当日池内、未 entered、价格有效才允许检测。
+    """买入检测公共前置：当日池内、未 entered、价格有效、不在冷却期才允许检测。
 
     返回 True 表示可继续检测；False 表示不满足前置（子信号应返回 NONE）。
     抽出为公共函数，供窗口拉升与昨收涨幅两个子信号复用，避免重复。
@@ -41,6 +41,10 @@ def _check_buyable_context(s, vt_symbol: str, tick: TickData) -> bool:
     if vt_symbol in s.entered:
         return False
     if not tick.last_price or tick.last_price <= 0:
+        return False
+    # 亏损离场冷却期内不再买入（策略持久化的是止损日，窗口按 COOLDOWN_DAYS 现算），
+    # 避免"清仓→再买→再清"反复止损
+    if s.is_buy_cooldown(vt_symbol, tick.datetime.strftime("%Y%m%d")):
         return False
     return True
 
@@ -222,14 +226,16 @@ class SectorBuySubSignal(SubSignal):
         if not sector_result.buyable:
             name: str = s._get_symbol_name(self.vt_symbol)
             buy_price: float = tick.last_price + s.price_add
+            context: str = format_sentiment_context(
+                sector_result.market_level,
+                sector_result.market_score,
+                sector_result.sector_name,
+                sector_result.sector_level,
+                sector_result.sector_score,
+            )
             skip_msg: str = (
                 f"行业情绪拦截 {self.vt_symbol}({name}) "
-                f"买入价格 {buy_price:.2f} "
-                f"大盘 评级 {sector_result.market_level} "
-                f"得分 {sector_result.market_score:.1f} "
-                f"行业 {sector_result.sector_name} "
-                f"评级 {sector_result.sector_level} "
-                f"得分 {sector_result.sector_score:.1f}，未达准入，不买入"
+                f"买入价格 {buy_price:.2f} {context}，未达准入，不买入"
             )
             s.write_log(skip_msg)
             s.send_wecom(skip_msg)
@@ -239,19 +245,19 @@ class SectorBuySubSignal(SubSignal):
             self._result = SignalResult()
             return self._result
 
-        # 可买：保留 prev 的 BUY，并补大盘/行业评级进 reason
+        # 可买：保留 prev 的 BUY，并补大盘/行业情绪上下文进 reason
+        context: str = format_sentiment_context(
+            sector_result.market_level,
+            sector_result.market_score,
+            sector_result.sector_name,
+            sector_result.sector_level,
+            sector_result.sector_score,
+        )
         self._result = SignalResult(
             type=prev.type,
             volume=prev.volume,
             price=prev.price,
-            reason=(
-                f"{prev.reason} "
-                f"大盘 评级 {sector_result.market_level} "
-                f"得分 {sector_result.market_score:.1f} "
-                f"行业 {sector_result.sector_name} "
-                f"评级 {sector_result.sector_level} "
-                f"得分 {sector_result.sector_score:.1f}"
-            ),
+            reason=f"{prev.reason} {context}",
         )
         return self._result
 
