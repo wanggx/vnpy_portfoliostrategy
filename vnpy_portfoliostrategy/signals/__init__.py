@@ -39,6 +39,7 @@ from .sentiment_signals import (
     SectorSellResult,
     SectorSellSignal,
     SentimentSignal,
+    format_market_context,
     format_sentiment_context,
 )
 
@@ -69,4 +70,5 @@ __all__ = [
     "SectorSellResult",
     "MarketRiskOffSignal",
     "format_sentiment_context",
+    "format_market_context",
 ]

@@ -6,10 +6,12 @@
    任一命中即产出 BUY 意向（不含行业评级）：
    - ``WindowSurgeSubSignal``：维护价格窗口，窗口内相对最低价涨幅 >= surge_pct 命中。
    - ``DayGainSubSignal``：相对昨收涨幅 >= surge_pct 命中。
-2. ``SectorBuySubSignal``（链次）：前序有 BUY 意向才查大盘 + 行业情绪；大盘评级中性以上时
-   行业需中性及以上，大盘评级中性及以下（含大盘快照不可用）时行业需中性以上（不含中性）。
-   达标则保留 BUY 并把大盘 / 行业评级补进 reason；否则记拦截日志/企微 + entered.add，
-   否定为 NONE（短路后续子信号）。
+2. ``SectorBuySubSignal``（链次）：前序有 BUY 意向才查大盘 + 行业情绪。大盘评级在中性
+   以下（偏弱 / 极弱）→ **大盘一票否决，任何标的都不买入**（只按日记一次拦截日志 / 企微，
+   不写 ``entered``，大盘当天转好后标的再起拉升仍可买入）。其余大盘评级下按档看行业：
+   大盘评级中性以上（快照可用）时行业需中性及以上，大盘评级中性（含大盘快照不可用）时
+   行业需中性以上（不含中性）。达标则保留 BUY 并把大盘 / 行业评级补进 reason；行业不达标
+   则记拦截日志 / 企微 + ``entered.add``，否定为 NONE（短路后续子信号）。
 
 需要持久化的全局状态（``entered`` 去重集合、标的池）经 ``self.strategy`` 访问；
 子信号只持有价格窗口、行业判定器实例等运行时状态。
@@ -24,7 +26,12 @@ from typing import TYPE_CHECKING
 from vnpy.trader.object import BarData, TickData
 
 from .base import SignalAggregator, SignalResult, SignalType, SubSignal
-from .sentiment_signals import SectorBuySignal, format_sentiment_context
+from .sentiment_signals import (
+    SectorBuyResult,
+    SectorBuySignal,
+    format_market_context,
+    format_sentiment_context,
+)
 
 if TYPE_CHECKING:
     from vnpy_portfoliostrategy.template import StrategyTemplate
@@ -197,23 +204,32 @@ class SurgeBuyOrSignal(OrCompositeSubSignal):
 
 
 class SectorBuySubSignal(SubSignal):
-    """单标的行业过滤子信号（链次）：前序有 BUY 意向才查大盘 + 行业。
+    """单标的情绪过滤子信号（链次）：前序有 BUY 意向才查大盘 + 行业。
 
-    ``on_tick`` 见 ``prev`` 为 BUY 才查大盘与所属行业情绪：大盘评级中性以上时行业需中性及
-    以上、大盘评级中性及以下（含大盘快照不可用）时行业需中性以上，达标则保留 BUY 并把大盘 /
-    行业评级补进 reason；否则记拦截日志/企微 + ``entered.add``，否定为 NONE（短路后续子信号）。
+    ``on_tick`` 见 ``prev`` 为 BUY 才查大盘与所属行业情绪：
+
+    - 大盘评级在中性以下（偏弱 / 极弱）：大盘一票否决，**任何标的都不买入**。此时不查行业，
+      按日去重记一次"大盘情绪拦截"日志 / 企微，否定为 NONE；**不写 ``entered``**，大盘当天
+      转好后该标的再起拉升仍可买入。
+    - 大盘其余评级：大盘评级中性以上（快照可用）时行业需中性及以上、大盘评级中性（含大盘
+      快照不可用）时行业需中性以上，达标则保留 BUY 并把大盘 / 行业评级补进 reason；行业不
+      达标则记拦截日志 / 企微 + ``entered.add``，否定为 NONE（短路后续子信号）。
+
     ``prev`` 非 BUY 时直接返回 NONE（不查情绪，避免每 tick 刷屏）。复用 ``SectorBuySignal``
     做大盘 + 行业评级判定。
     """
 
     def __init__(self, vt_symbol: str, strategy: StrategyTemplate) -> None:
-        """构造函数：持有行业情绪判定器与本次判定结果。"""
+        """构造函数：持有行业情绪判定器、本次判定结果与大盘拦截的按日去重标记。"""
         super().__init__(vt_symbol, strategy)
         self._sector: SectorBuySignal = SectorBuySignal(strategy)
         self._result: SignalResult = SignalResult()
+        # 大盘拦截消息已推送的日期（YYYYMMDD）：大盘拦截可能持续整日、每 tick 都命中，
+        # 按日去重避免同一标的反复刷日志 / 企微
+        self._market_block_date: str = ""
 
     def on_tick(self, tick: TickData, prev: SignalResult) -> SignalResult:
-        """前序有 BUY 意向才查大盘+行业；不可买则拦截+否定，可买则保留并补评级。"""
+        """前序有 BUY 意向才查大盘+行业；大盘/行业不可买则拦截+否定，可买则保留并补评级。"""
         # 前序无买入意向，不查大盘/行业（短路：避免每 tick 刷屏）
         if prev.type != SignalType.BUY:
             self._result = SignalResult()
@@ -221,6 +237,12 @@ class SectorBuySubSignal(SubSignal):
 
         s = self.strategy
         sector_result = self._sector.is_buyable(self.vt_symbol)
+
+        # 大盘拦截：大盘情绪中性以下时不买入任何标的（不影响 entered，当日转好仍可买入）
+        if sector_result.market_blocked:
+            self._log_market_block(tick, sector_result)
+            self._result = SignalResult()
+            return self._result
 
         # 行业拦截：记日志/企微 + 标记本轮已处理，否定买入
         if not sector_result.buyable:
@@ -260,6 +282,26 @@ class SectorBuySubSignal(SubSignal):
             reason=f"{prev.reason} {context}",
         )
         return self._result
+
+    def _log_market_block(self, tick: TickData, sector_result: SectorBuyResult) -> None:
+        """大盘中性以下拦截：按日去重记一次日志 + 企微（同一标的当日只推一条）。"""
+        today: str = tick.datetime.strftime("%Y%m%d")
+        if self._market_block_date == today:
+            return
+        self._market_block_date = today
+
+        s = self.strategy
+        name: str = s._get_symbol_name(self.vt_symbol)
+        buy_price: float = tick.last_price + s.price_add
+        context: str = format_market_context(
+            sector_result.market_level, sector_result.market_score
+        )
+        skip_msg: str = (
+            f"大盘情绪拦截 {self.vt_symbol}({name}) "
+            f"买入价格 {buy_price:.2f} {context}，大盘中性以下不买入任何标的"
+        )
+        s.write_log(skip_msg)
+        s.send_wecom(skip_msg)
 
     def on_bar(self, bar: BarData, prev: SignalResult) -> SignalResult:
         """K线推送回调：本信号走 tick，此处不处理，原样返回 prev。"""
