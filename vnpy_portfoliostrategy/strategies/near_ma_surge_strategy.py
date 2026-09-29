@@ -50,9 +50,9 @@ class NearMaSurgeStrategy(StrategyTemplate):
 
     布林上轨止盈（兜底）：每日盘前按**当天可卖出的持仓**批量取**前复权**日线，算当日
     日线布林上轨（MA + boll_dev × σ，σ 用总体标准差，与 ``ArrayManager.boll`` 同口径）
-    存入 ``boll_up``；盘中现价触及上轨且当前收益 > 0 时全清（亏损不卖，避免下跌后的
-    反弹假突破被清仓）。它排在价格卖出之后，只在未触发止损、未达 10%/20% 止盈档、
-    未回撤、未跌破保底时生效。
+    存入 ``boll_up``；盘中现价触及上轨且当前收益不低于 ``BOLL_MIN_PROFIT_PCT``（默认 5%）
+    时全清（收益不足不卖：含亏损时的反弹假突破）。它排在价格卖出之后，只在未触发止损、
+    未达 10%/20% 止盈档、未回撤、未跌破保底时生效（即 5% ≤ 收益 < 10%）。
 
     信号架构分两层：买入/卖出各一个总信号（``BuyAggregator`` / ``SellAggregator``），
     内部按 ``vt_symbol`` 维护子信号映射并分发行情；子信号经 ``signal_result()`` 返回
@@ -120,6 +120,8 @@ class NearMaSurgeStrategy(StrategyTemplate):
     # 布林上轨止盈（卖出兜底，可配置）：盘前按"当天可卖出的持仓"算当日上轨
     boll_window: int = 20                    # 日线布林周期数
     boll_dev: float = 2.0                    # 标准差倍数
+    # 收益门槛：不足此值不按上轨卖（含亏损——挡反弹假突破；也避免只赚一两点就离场）
+    BOLL_MIN_PROFIT_PCT: float = 0.05
     BOLL_LOOKBACK_DAYS: int = 60             # 取数回溯自然日（≈40 交易日，含节假日/停牌冗余）
     BOLL_DIVIDEND_TYPE: str = "front"        # 前复权（可切 "front_ratio" 等比前复权）
 

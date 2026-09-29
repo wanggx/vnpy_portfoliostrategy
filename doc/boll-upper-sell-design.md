@@ -12,6 +12,7 @@
 | 2026-09-29 | v0.3 | 取数范围收窄：**只算“当天可卖出的持仓”**（不再按当日池全量）；时机改为 `on_tick` 日切 + 内存标记，与标的池刷新解耦（§5.1） |
 | 2026-09-29 | v0.4 | 复权口径改为**前复权**：因此不能再用 `engine.load_bar`（其 `XtDatafeed` 把 `dividend_type` 写死为 `none`），改为直连 `xtdata.get_market_data_ex` 批量取数（§5.2–§5.3） |
 | 2026-09-29 | v1.0 | **已实现**（改动清单与验证结果见 §9） |
+| 2026-09-29 | v1.1 | 盈利门槛从 `> 0` 提到 **`>= BOLL_MIN_PROFIT_PCT`（默认 5%）**：收益不足不卖，生效区间变为 5% ≤ 收益 < 10% |
 
 ## 1. 背景与目标
 
@@ -40,8 +41,8 @@
 | 1 | 布林周期基准 | **日线**（每日盘前刷新一次） | 最省：无 tick 合成、无 per-tick 计算；代价是上轨一天内不变，日内不敏感 |
 | 2 | 触发语义 | **触及即卖**：`last_price >= boll_up`（不做"上穿"判定、不留触发标记） | 实现最简单；重复触发由 T+1 卖出冻结量天然抑制（见 §6.3） |
 | 3 | 卖出量 | **全清**（`SignalType.CLEAR`，`volume = get_sellable(vt_symbol)`） | 与"止盈"定位一致；不留尾仓，避免与减半档语义打架 |
-| 4 | 链内优先级 | 排在 `PriceSellSubSignal` **之后**（即止损/20%/10%/回撤/保底全部优先） | 定位是"兜底"：只在 0 < 收益 < 10% 且摸到上轨时生效 |
-| 5 | 盈利门槛 | 必须 `profit_pct > 0` | 防止"下跌后的反弹假突破上轨"在亏损位置被清仓 |
+| 4 | 链内优先级 | 排在 `PriceSellSubSignal` **之后**（即止损/20%/10%/回撤/保底全部优先） | 定位是"兜底"：只在 5% ≤ 收益 < 10% 且摸到上轨时生效 |
+| 5 | 盈利门槛 | 收益必须 `>= BOLL_MIN_PROFIT_PCT`（默认 **5%**） | 两个作用：一是防"下跌后的反弹假突破上轨"在亏损位置清仓，二是避免只赚一两个点就提前离场（与 `half_profit_pct` 10% 之间形成 5%~10% 的落袋窗口） |
 | 6 | 取数范围 | **只算“当天可卖出的持仓”**：`pos > 0 且 get_sellable(vt) > 0` | 不能卖的标的算上轨没有意义（今仓 T+1 不可卖、无持仓的池内标的走不到卖出分支）；RPC 次数从“池子几百只”降到“持仓只数”（见 §5.1） |
 | 7 | 复权方式 | **前复权**（`dividend_type="front"`） | 前复权序列的最后一根 = 最新真实价（历史价按除权因子折算到最新口径），与盘中 `tick.last_price` 同尺度；不复权的话，窗口内有除权的票 band 会高高飘在实盘价上方（永远碰不到）。代价：**取数必须绕开引擎**（见 §5.2） |
 
@@ -52,7 +53,7 @@
 ```
 未触发止损、未达 clear_profit_pct(20%)、未达 half_profit_pct(10%)、
 未触发回撤止盈、未跌破保底线
-且 0 < 当前收益 < 10%
+且 收益 >= BOLL_MIN_PROFIT_PCT(5%)
 且 现价 >= 日线布林上轨
 → 全清
 ```
@@ -126,6 +127,7 @@ up = float(closes.mean()) + dev * float(closes.std(ddof=0))
 | `boll_window` | `20` | 日线周期数，进 `parameters`（可回测/优化） |
 | `boll_dev` | `2.0` | 标准差倍数，进 `parameters` |
 | `BOLL_LOOKBACK_DAYS` | `60` | 取数回溯的**自然日**（常量，不进 `parameters`）。20 个交易日 ≈ 28 自然日，再加节假日/停牌冗余 → 取 60（≈40 交易日）。多取不增加成本（仍是同一次批量 RPC），只影响“能取到几根日线” |
+| `BOLL_MIN_PROFIT_PCT` | `0.05` | 收益门槛：不足此值不按上轨卖（含亏损）。要调可改常量，或后续需要回测/优化时再挪进 `parameters` |
 | `BOLL_DIVIDEND_TYPE` | `"front"` | 复权方式：前复权。可切 `"front_ratio"`（等比前复权，低价股更稳健）；两者的取值都由大 QMT 支持 |
 
 `boll_up` 是**运行时派生量**：放内存字典即可，不进 `variables`（不落盘），重启后盘前重算。前复权序列还会随新除权事件整体重算，落盘的历史值第二天就可能失真——更不该存。
@@ -271,7 +273,7 @@ if boll_up <= 0:                       # 数据不足 / 取数失败 → 降级�
     return NONE
 
 profit_pct = (tick.last_price - entry_price) / entry_price
-if profit_pct <= 0:                    # 决策 5：亏损（含保本）不按上轨卖
+if profit_pct < s.BOLL_MIN_PROFIT_PCT:  # 决策 5：收益不足 5%（含亏损）不按上轨卖
     return NONE
 
 if tick.last_price >= boll_up:
@@ -314,6 +316,7 @@ return NONE
 | `boll_window` | int | 20 | ✅ | 日线布林周期数 |
 | `boll_dev` | float | 2.0 | ✅ | 标准差倍数 |
 | `BOLL_LOOKBACK_DAYS` | int | 60 | ❌（常量） | 取数回溯自然日数 |
+| `BOLL_MIN_PROFIT_PCT` | float | 0.05（5%） | ❌（常量，策略类里） | 收益门槛：不足不卖 |
 
 ## 7. 边界与降级清单
 
@@ -321,7 +324,7 @@ return NONE
 | --- | --- |
 | 日线根数 < `boll_window`（新股 / 长期停牌） | `boll_up = 0` → 本信号不产出；止损等其它档照常 |
 | 取数失败 / 返回全 0（前复权未落地）/ RPC 异常 | `boll_up` 不写该标的 → 本信号不产出；写一条日志，**绝不抛异常**（`call_strategy_func` 会把异常当致命错误停掉整个策略） |
-| `σ = 0`（连续一字板 / 长期停牌后复牌） | `boll_up = MA`（等于均值）；可能立即满足"现价 ≥ 上轨"，但 `profit_pct > 0` 门槛仍在。是否需要额外过滤，留作观察项 |
+| `σ = 0`（连续一字板 / 长期停牌后复牌） | `boll_up = MA`（等于均值）；可能立即满足"现价 ≥ 上轨"，但 `profit_pct >= 5%` 门槛仍在。是否需要额外过滤，留作观察项 |
 | 除权除息日 | 前复权已把历史价折算到最新口径，band 与盘中实盘价同尺度——这正是选前复权的原因。残余风险：数据源的复权因子若尚未包含**当日**的除权事件，当日 band 仍会偏高（漏触发）→ 观察项：可对比“最后一根前复权收盘”与首 tick 的 `pre_close` 偏差 |
 | 当天已卖出（清仓/止损/情绪离场） | 仓位归 0 → 策略不进卖出分支；`on_tick` 中 `cooldown` 只作用于买入侧，不影响本信号 |
 | 当日买入（今仓） | `get_sellable == 0` → 不进目标集合（当日无上轨）；且 T+1 下当天本来也卖不出，次日变昨仓后才会算上轨 |
@@ -369,7 +372,7 @@ python -m py_compile vnpy_portfoliostrategy/signals/sell_signals.py vnpy_portfol
 | --- | --- |
 | `signals/sell_signals.py` | 新增 `BollUpperSellSubSignal`；`SellSubSignal.sub_factories` 末尾追加它；模块 docstring 补第 3 条（含与价格档的优先级关系） |
 | `signals/__init__.py` | 导出 `BollUpperSellSubSignal` 并进 `__all__`；子包 docstring 同步 |
-| `strategies/near_ma_surge_strategy.py` | 参数 `boll_window` / `boll_dev`（进 `parameters`）；常量 `BOLL_LOOKBACK_DAYS` / `BOLL_DIVIDEND_TYPE` / `EXCHANGE_CODE_SUFFIX`；运行时状态 `boll_up` / `boll_date`；新增 `_refresh_boll_bands` / `_boll_upper` / `_vt_symbol_to_code`；`on_tick` 日切块挂钩（在 `refresh_universe` 之后） |
+| `strategies/near_ma_surge_strategy.py` | 参数 `boll_window` / `boll_dev`（进 `parameters`）；常量 `BOLL_MIN_PROFIT_PCT`（v1.1 加）/ `BOLL_LOOKBACK_DAYS` / `BOLL_DIVIDEND_TYPE` / `EXCHANGE_CODE_SUFFIX`；运行时状态 `boll_up` / `boll_date`；新增 `_refresh_boll_bands` / `_boll_upper` / `_vt_symbol_to_code`；`on_tick` 日切块挂钩（在 `refresh_universe` 之后） |
 | `doc/signals-flow.html` | 卖出流程图新增 ⑨ 布林上轨兜底（原 ⑨ 顺延为 ⑩），参数表加一行 |
 | `doc/predictive-signals-design.md` | §1 现状表加一行 |
 
@@ -378,4 +381,4 @@ python -m py_compile vnpy_portfoliostrategy/signals/sell_signals.py vnpy_portfol
 - `python -m py_compile` 三个改动文件：通过；
 - `_boll_upper` 与 `ArrayManager.boll(20, 2.0)`、`talib.SMA + 2×talib.STDDEV(n, 1)` 数值一致（差 ~1e-12），证明 σ 口径（`ddof=0`）没写错；
 - `_boll_upper` 边界全返回 0：根数不足、全 0（前复权未落地）、含负价 / NaN / inf、缺 `close` 列、`None`；
-- 信号判定与链内优先级 15 项断言全通过：触及上轨且有盈利 → CLEAR（全清量 = 可卖量、限价 = 现价 − `price_add`、reason 含上轨与收益）；轨下 / 亏损 / 无上轨 / 可卖量 0 / 无开仓价 → NONE；收益 21% → 价格档清仓先命中（布林不跑）；亏损 5% → 止损先命中（布林不跑）。
+- 信号判定与链内优先级 **18 项断言全通过**：收益 6% 触上轨 → CLEAR（全清量 = 可卖量、限价 = 现价 − `price_add`、reason 含上轨与收益）；**收益 3%（未达 5% 门槛）但已在上轨上 → NONE**；**收益恰好 5% → CLEAR**；轨下 / 亏损 / 无上轨 / 可卖量 0 / 无开仓价 → NONE；收益 21% → 价格档清仓先命中（布林不跑）；亏损 5% → 止损先命中（布林不跑）。

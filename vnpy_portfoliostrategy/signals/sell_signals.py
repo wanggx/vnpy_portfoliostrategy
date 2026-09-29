@@ -15,10 +15,11 @@
    MAX_DRAWDOWN_PCT 卖出，以及保底收益线（最大收益 >= 10% 保底 5%、>= 5% 保底 2%、
    >= 3% 保底 0%）。
 3. ``BollUpperSellSubSignal``（兜底）：布林上轨止盈。当日日线布林上轨（前复权，盘前由
-   策略按“当天可卖出的持仓”算好，放在 ``strategy.boll_up``）被现价触及且当前收益为正
-   时全清；亏损不触发（下跌后的反弹假突破不清仓），取不到上轨（样本不足 / 前复权数据
-   未落地）也不触发。排在价格卖出之后，因此只在未触发止损、未达 10%/20% 止盈档、
-   未回撤、未跌破保底时生效（即 0 < 收益 < 10% 的兜底止盈）。
+   策略按“当天可卖出的持仓”算好，放在 ``strategy.boll_up``）被现价触及且当前收益不低于
+   ``BOLL_MIN_PROFIT_PCT``（默认 5%）时全清；收益不足不触发（含亏损：下跌后的反弹假突破
+   不清仓），取不到上轨（样本不足 / 前复权数据未落地）也不触发。排在价格卖出之后，
+   因此只在未触发止损、未达 10%/20% 止盈档、未回撤、未跌破保底时生效
+   （即 5% ≤ 收益 < 10% 的兜底止盈）。
 
 减半产出 ``SELL``（部分卖出），其余卖出产出 ``CLEAR``（全清）。
 
@@ -298,14 +299,15 @@ class PriceSellSubSignal(SubSignal):
 
 
 class BollUpperSellSubSignal(SubSignal):
-    """单标的布林上轨止盈子信号（兜底）：现价触及当日上轨且有盈利 → 全清。
+    """单标的布林上轨止盈子信号（兜底）：现价触及当日上轨且收益达标 → 全清。
 
     ``on_tick`` 按顺序判定（``prev`` 忽略，优先级组合内的独立判定支）：
 
     - 开仓价与现价有效，且 ``strategy.boll_up`` 里有该标的当日上轨（策略盘前按
       “当天可卖出的持仓”算好；取数失败 / 日线不足 ``window`` 根 / 前复权数据未落地
       时为 0，即不可用）；
-    - 当前收益 > 0：价格在上轨之上但仍在亏损（下跌后的反弹假突破）不清仓；
+    - 当前收益 >= ``strategy.BOLL_MIN_PROFIT_PCT``（默认 5%）：收益不足时不卖——既挡住
+      “下跌后的反弹假突破”（价格在上轨上但仍在亏损），也避免只赚一两个点就提前离场；
     - 现价 >= 上轨 → ``CLEAR`` 全清（可卖量），否则 NONE。
 
     是“触及即卖”而非“上穿一次”：不留触发标记，重复触发由 T+1 卖出冻结量天然抑制
@@ -321,7 +323,7 @@ class BollUpperSellSubSignal(SubSignal):
         self._sector: SectorSellSignal = SectorSellSignal(strategy)
 
     def on_tick(self, tick: TickData, prev: SignalResult) -> SignalResult:
-        """现价触及当日上轨且有盈利 → 全清，否则 NONE（prev 忽略）。"""
+        """现价触及当日上轨且收益 >= BOLL_MIN_PROFIT_PCT → 全清，否则 NONE（prev 忽略）。"""
         s = self.strategy
         entry_price: float | None = s.entry_prices.get(self.vt_symbol, None)
         boll_up: float = s.boll_up.get(self.vt_symbol, 0.0)
@@ -334,9 +336,10 @@ class BollUpperSellSubSignal(SubSignal):
             self._result = SignalResult()
             return self._result
 
-        # 必须盈利才按上轨走：价格在轨上但仍在亏损时不卖（反弹假突破）
+        # 收益门槛：不足 BOLL_MIN_PROFIT_PCT（默认 5%）不卖——既挡住"下跌后的反弹假突破"
+        # （价格在上轨上但仍在亏损），也避免只赚一两个点就提前离场
         profit_pct: float = (tick.last_price - entry_price) / entry_price
-        if profit_pct <= 0 or tick.last_price < boll_up:
+        if profit_pct < s.BOLL_MIN_PROFIT_PCT or tick.last_price < boll_up:
             self._result = SignalResult()
             return self._result
 
