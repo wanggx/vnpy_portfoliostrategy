@@ -1,4 +1,6 @@
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
+
+import numpy as np
 
 from vnpy.trader.constant import Exchange, Direction, Status
 from vnpy.trader.object import TickData, BarData, TradeData, OrderData
@@ -23,6 +25,11 @@ CODE_SUFFIX_EXCHANGE: dict[str, Exchange] = {
     ".BJ": Exchange.BSE,
 }
 
+# vnpy 交易所值 -> xtquant 代码后缀（上面映射的反转，用于 vt_symbol 反查大 QMT 代码）
+EXCHANGE_CODE_SUFFIX: dict[str, str] = {
+    exchange.value: suffix for suffix, exchange in CODE_SUFFIX_EXCHANGE.items()
+}
+
 
 class NearMaSurgeStrategy(StrategyTemplate):
     """Near-Ma 快速拉升策略
@@ -40,6 +47,12 @@ class NearMaSurgeStrategy(StrategyTemplate):
     回撤超过 10% 卖出，以及最大收益 >= 10% 保底 5%、>= 5% 保底 2%、>= 3% 不赔钱的
     保底收益线。亏损离场（止损 / 情绪离场）后记录止损日，该标的在止损日起
     ``COOLDOWN_DAYS`` 个自然日的冷却期内不再买入，避免"清仓→再买→再清"的反复止损。
+
+    布林上轨止盈（兜底）：每日盘前按**当天可卖出的持仓**批量取**前复权**日线，算当日
+    日线布林上轨（MA + boll_dev × σ，σ 用总体标准差，与 ``ArrayManager.boll`` 同口径）
+    存入 ``boll_up``；盘中现价触及上轨且当前收益 > 0 时全清（亏损不卖，避免下跌后的
+    反弹假突破被清仓）。它排在价格卖出之后，只在未触发止损、未达 10%/20% 止盈档、
+    未回撤、未跌破保底时生效。
 
     信号架构分两层：买入/卖出各一个总信号（``BuyAggregator`` / ``SellAggregator``），
     内部按 ``vt_symbol`` 维护子信号映射并分发行情；子信号经 ``signal_result()`` 返回
@@ -104,6 +117,12 @@ class NearMaSurgeStrategy(StrategyTemplate):
     half_profit_pct: float = 0.10        # 收益率达此值时仓位减半（默认 10%）
     clear_profit_pct: float = 0.20       # 收益率达此值时清仓（默认 20%）
 
+    # 布林上轨止盈（卖出兜底，可配置）：盘前按"当天可卖出的持仓"算当日上轨
+    boll_window: int = 20                    # 日线布林周期数
+    boll_dev: float = 2.0                    # 标准差倍数
+    BOLL_LOOKBACK_DAYS: int = 60             # 取数回溯自然日（≈40 交易日，含节假日/停牌冗余）
+    BOLL_DIVIDEND_TYPE: str = "front"        # 前复权（可切 "front_ratio" 等比前复权）
+
     parameters: list = [
         "industry_name",
         "fixed_size",
@@ -112,6 +131,8 @@ class NearMaSurgeStrategy(StrategyTemplate):
         "surge_window",
         "half_profit_pct",
         "clear_profit_pct",
+        "boll_window",
+        "boll_dev",
     ]
 
     variables: list = [
@@ -162,6 +183,13 @@ class NearMaSurgeStrategy(StrategyTemplate):
         # 清仓/减半止盈、回撤与保底全部以它为准；分笔成交、加仓、经纪商持仓回报都不得改动
         self.entry_prices: dict[str, float] = {}
         self.max_profit_pct: dict[str, float] = {}
+
+        # 布林上轨（当日）：vt_symbol -> 上轨价，盘前按"当天可卖出的持仓"算一次；
+        # 0 表示不可用（样本不足 / 前复权数据未落地）。运行时派生量，不落盘
+        self.boll_up: dict[str, float] = {}
+        # 最近一次刷新布林上轨的日期（YYYYMMDD）：内存标记（非持久化变量），
+        # 盘中重启当天也会补算一次，不会整天没有上轨
+        self.boll_date: str = ""
 
     def on_init(self) -> None:
         """策略初始化回调
@@ -306,11 +334,16 @@ class NearMaSurgeStrategy(StrategyTemplate):
         策略为协调器：日切刷新标的池、转发行情给信号器、按 ``SignalResult`` 的
         type 下单；拉升检测/行业过滤/卖出判定均下沉到买入/卖出子信号。
         """
-        # 1. 日切刷新：日期变更且到盘前刷新时刻（09:15），重新拉取当日池
+        # 1. 日切刷新：日期变更且到盘前刷新时刻（09:15），重新拉取当日池；随后刷新布林
+        #    上轨。顺序不能颠倒：refresh_universe 末尾会同步 T+1 昨仓，之后 get_sellable
+        #    才是"今天的可卖量"；boll_date 是内存标记，盘中重启当天也会补算一次
         tick_date: str = tick.datetime.strftime("%Y%m%d")
-        if tick_date != self.last_refresh_date:
-            if tick.datetime.time() >= self.REFRESH_TIME:
-                self.refresh_universe()
+        tick_time = tick.datetime.time()
+        if tick_date != self.last_refresh_date and tick_time >= self.REFRESH_TIME:
+            self.refresh_universe()
+        if tick_date != self.boll_date and tick_time >= self.REFRESH_TIME:
+            self.boll_date = tick_date
+            self._refresh_boll_bands()
 
         # 集合竞价时段仅刷新标的池，不做买卖判定与窗口采样
         if not self._is_trading_session(tick):
@@ -604,6 +637,102 @@ class NearMaSurgeStrategy(StrategyTemplate):
         )
         self.strategy_engine.sync_strategy_data(self)
         self.put_event()
+
+    def _refresh_boll_bands(self) -> None:
+        """盘前刷新当日布林上轨：只算"当天可卖出的持仓"，整体替换 ``self.boll_up``。
+
+        只算可卖持仓：当日买入的（今仓）T+1 不可卖、无持仓的标的走不到卖出分支，给它们
+        算上轨没有意义（白花取数时间）。取数用**前复权**日线：前复权序列的最后一根 =
+        最新真实价，与盘中 tick 同尺度，窗口内有除权的票也不会出现"上轨高高飘着、永远
+        碰不到"。取不到 / 日线不足 ``boll_window`` 根 / 全 0（前复权数据未落地）的标的
+        写 0（不可用），由卖出信号降级不产出。
+
+        取数失败只记日志，**绝不抛异常**：``call_strategy_func`` 会把异常当致命错误
+        停掉整个策略。
+        """
+        targets: list[str] = [
+            vt_symbol for vt_symbol, pos in self.pos_data.items()
+            if pos > 0 and self.get_sellable(vt_symbol) > 0
+        ]
+        # 大 QMT 代码 -> vt_symbol；拿不到代码的标的取不到数据，直接跳过
+        codes: dict[str, str] = {}
+        for vt_symbol in targets:
+            code: str = self._vt_symbol_to_code(vt_symbol)
+            if code:
+                codes[code] = vt_symbol
+        if not codes:
+            self.boll_up = {}
+            return
+
+        t: datetime = datetime.now()
+        # end 取昨天：不依赖数据源过滤当日未完成日线，盘中重启去算也仍是"昨日及以前"的上轨
+        end: str = (date.today() - timedelta(days=1)).strftime("%Y%m%d")
+        start: str = (
+            date.today() - timedelta(days=self.BOLL_LOOKBACK_DAYS)
+        ).strftime("%Y%m%d")
+        try:
+            data: dict = xtdata.get_market_data_ex(
+                field_list=[],
+                stock_list=list(codes.keys()),
+                period="1d",
+                start_time=start,
+                end_time=end,
+                count=-1,
+                dividend_type=self.BOLL_DIVIDEND_TYPE,
+                fill_data=False,
+            ) or {}
+        except Exception as exc:  # noqa: BLE001 - 取数失败不影响策略运行
+            self.boll_up = {}
+            self.write_log(f"布林上轨取数失败，当日不启用该兜底止盈：{exc}")
+            return
+
+        bands: dict[str, float] = {}
+        empty: list[str] = []
+        for code, vt_symbol in codes.items():
+            up: float = self._boll_upper(data.get(code))
+            if up > 0:
+                bands[vt_symbol] = up
+            else:
+                empty.append(vt_symbol)
+        self.boll_up = bands
+
+        msg: str = (
+            f"布林上轨刷新 {len(bands)}/{len(targets)} 只，"
+            f"耗时 {(datetime.now() - t).total_seconds():.2f}s"
+        )
+        if empty:
+            # 无上轨的标的当日退化为"没有该兜底止盈"（止损等其它档不受影响）
+            msg += f"，无上轨 {len(empty)} 只（{'、'.join(empty[:5])}）"
+        self.write_log(msg)
+
+    def _boll_upper(self, df) -> float:
+        """由前复权日线收盘价算布林上轨；样本不足或价格异常（含前复权全 0）返回 0。
+
+        与 ``vnpy.trader.utility.ArrayManager.boll`` 同口径：均值 = 收盘价简单均值，
+        标准差用**总体标准差**（``ddof=0``，对应 ``talib.STDDEV(nbdev=1)``）；用 pandas
+        默认的 ``ddof=1`` 会与其它策略的 ``am.boll`` 数值不一致。
+        """
+        if df is None or "close" not in getattr(df, "columns", ()):
+            return 0.0
+        closes = np.asarray(df["close"].to_numpy(), dtype=float)[-self.boll_window:]
+        if closes.size < self.boll_window:
+            return 0.0
+        # 前复权取数在服务端原始日线/除权因子未落地时会返回全 0（实测），必须挡住，
+        # 否则会算出 0 或负的上轨
+        if not np.isfinite(closes).all() or (closes <= 0).any():
+            return 0.0
+        return float(closes.mean()) + self.boll_dev * float(closes.std(ddof=0))
+
+    @staticmethod
+    def _vt_symbol_to_code(vt_symbol: str) -> str:
+        """vnpy vt_symbol（如 600000.SSE）转大 QMT 代码（如 600000.SH）；无法识别返回空串。"""
+        symbol, dot, exchange_value = vt_symbol.rpartition(".")
+        if not dot:
+            return ""
+        suffix: str | None = EXCHANGE_CODE_SUFFIX.get(exchange_value)
+        if suffix is None:
+            return ""
+        return f"{symbol}{suffix}"
 
     def _get_sql_engine(self) -> any:
         """获取 SqlApp 引擎，取不到时写日志返回 None"""

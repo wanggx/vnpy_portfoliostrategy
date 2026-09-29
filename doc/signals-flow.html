@@ -210,10 +210,11 @@
     <h2>二、卖出逻辑</h2>
     <p class="hint">
       前置只要求"持仓 &gt; 0 且可卖量 &gt; 0"（T+1 下当日买入可卖量为 0，整条链跳过）。
-      之后按优先级短路：<b>情绪档优先</b>，命中即全清、价格档不跑；否则价格档按 ①→⑤ 取首个命中。
+      之后按优先级短路：<b>情绪档优先</b>，命中即全清、价格档不跑；否则价格档按 ①→⑤ 取首个命中；
+      再不然由<b>布林上轨兜底</b>（现价触及当日日线布林上轨且收益 &gt; 0 → 全清）。
     </p>
 
-    <svg viewBox="0 0 1040 1360" role="img" aria-label="卖出流程图">
+    <svg viewBox="0 0 1040 1500" role="img" aria-label="卖出流程图">
       <defs>
         <marker id="arS" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
           <path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/>
@@ -331,23 +332,37 @@
       <line class="arrow" x1="220" y1="1050" x2="220" y2="1082" marker-end="url(#arS)"/>
       <text class="t-label" x="205" y="1070" text-anchor="end">否</text>
 
-      <!-- 全部未命中 -->
+      <!-- 布林上轨兜底 -->
       <g transform="translate(50,1090)">
-        <rect class="node-t" width="340" height="70" rx="10"/>
-        <text x="170" y="32" text-anchor="middle"><tspan x="170">⑨ 全部未命中 → 不动</tspan><tspan x="170" dy="18">继续持有，下个 tick 重新判定</tspan></text>
+        <rect class="node-g" width="340" height="90" rx="10"/>
+        <text x="170" y="25" text-anchor="middle"><tspan x="170">⑨ 现价 ≥ 当日布林上轨？</tspan><tspan x="170" dy="18">日线 MA + boll_dev × σ（前复权）</tspan><tspan x="170" dy="18">且当前收益 &gt; 0</tspan></text>
       </g>
-      <line class="dash" x1="392" y1="1125" x2="512" y2="1125"/>
-      <text class="t-label" x="452" y="1118" text-anchor="middle">注</text>
+      <line class="arrow" x1="392" y1="1135" x2="512" y2="1135" marker-end="url(#arS)"/>
+      <text class="t-label" x="452" y="1128" text-anchor="middle">是</text>
       <g transform="translate(520,1090)">
+        <rect class="node-hit" width="480" height="90" rx="10"/>
+        <text x="240" y="32" text-anchor="middle"><tspan x="240">命中 → 全清（布林上轨止盈）</tspan><tspan x="240" dy="18">亏损不卖（反弹假突破）；取不到上轨不触发</tspan></text>
+      </g>
+      <line class="arrow" x1="220" y1="1180" x2="220" y2="1212" marker-end="url(#arS)"/>
+      <text class="t-label" x="205" y="1200" text-anchor="end">否</text>
+
+      <!-- 全部未命中 -->
+      <g transform="translate(50,1220)">
+        <rect class="node-t" width="340" height="70" rx="10"/>
+        <text x="170" y="32" text-anchor="middle"><tspan x="170">⑩ 全部未命中 → 不动</tspan><tspan x="170" dy="18">继续持有，下个 tick 重新判定</tspan></text>
+      </g>
+      <line class="dash" x1="392" y1="1255" x2="512" y2="1255"/>
+      <text class="t-label" x="452" y="1248" text-anchor="middle">注</text>
+      <g transform="translate(520,1220)">
         <rect class="node-n" width="480" height="70" rx="10"/>
-        <text class="t-note" x="240" y="32" text-anchor="middle"><tspan x="240">③～⑧ 任一档命中 → 统一下单</tspan><tspan x="240" dy="18">再走下方「命中后处理」</tspan></text>
+        <text class="t-note" x="240" y="32" text-anchor="middle"><tspan x="240">③～⑨ 任一档命中 → 统一下单</tspan><tspan x="240" dy="18">再走下方「命中后处理」</tspan></text>
       </g>
 
       <!-- 命中后处理 -->
-      <line class="dash" x1="760" y1="1160" x2="760" y2="1196" marker-end="url(#arS)"/>
-      <g transform="translate(50,1200)">
+      <line class="dash" x1="760" y1="1290" x2="760" y2="1326" marker-end="url(#arS)"/>
+      <g transform="translate(50,1330)">
         <rect class="node-a" width="950" height="120" rx="10"/>
-        <text class="t-title" x="475" y="28" text-anchor="middle">命中后处理（③～⑧ 任一档命中都执行）</text>
+        <text class="t-title" x="475" y="28" text-anchor="middle">命中后处理（③～⑨ 任一档命中都执行）</text>
         <text x="22" y="52">① 下单：全清 → 可卖量；减半 → 半仓向上取整到 100 股；价格 = 现价 − price_add</text>
         <text x="22" y="74">② 日志 + 企业微信：卖出信号 代码(名称) &lt;原因&gt; 卖出价格 … 当前收益 … 最大收益 …（原因里含大盘/行业四项情绪）</text>
         <text x="22" y="96">③ CLEAR 且亏损 → 记录止损日并立即落盘（冷却）；止盈离场不加冷却</text>
@@ -376,6 +391,7 @@
       <tr><td><code>clear_profit_pct</code> / <code>half_profit_pct</code></td><td>20% / 10%</td><td>清仓止盈 / 减半止盈</td></tr>
       <tr><td><code>MAX_DRAWDOWN_PCT</code></td><td>10%</td><td>相对历史最大收益的回撤上限</td></tr>
       <tr><td><code>TIER_HIGH_PCT</code> / <code>TIER_LOW_PCT</code> / <code>TIER_BREAKEVEN_PCT</code></td><td>10% / 5% / 3%</td><td>保底分档触发线（对应保底 5% / 2% / 0%）</td></tr>
+      <tr><td><code>boll_window</code> / <code>boll_dev</code></td><td>20 / 2.0</td><td>日线布林上轨（前复权 <code>dividend_type="front"</code>）：盘前按"当天可卖出的持仓"算 20 日 MA + 2×σ；盘中触及且收益 &gt; 0 → 全清；排在价格档之后，故实际生效区间是 0 &lt; 收益 &lt; 10%</td></tr>
       <tr><td><code>COOLDOWN_DAYS</code></td><td>2</td><td>亏损离场后记录止损日 D，D ~ D+2 天不再买入该标的</td></tr>
     </table>
 

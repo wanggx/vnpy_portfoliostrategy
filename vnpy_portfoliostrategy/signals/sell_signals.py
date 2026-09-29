@@ -1,7 +1,7 @@
 """组合策略卖出信号器：情绪卖出优先，其次价格卖出（优先级组合）。
 
 卖出总信号 ``SellAggregator`` 内部聚合一个优先级组合子信号 ``SellSubSignal``，
-其按优先级短路运行两条独立子信号：
+其按优先级短路运行三条独立子信号：
 
 1. ``SectorSellSubSignal``（优先）：情绪卖出。收益低于 ``TIER_BREAKEVEN_PCT``
    （``profit < TIER_BREAKEVEN_PCT``，**含亏损**）且所属行业评级在中性以下（偏弱/极弱）
@@ -14,6 +14,11 @@
    （仓位减半后剩余不足一个标准开仓量 fixed_size，据此不再重复减半）、回撤超
    MAX_DRAWDOWN_PCT 卖出，以及保底收益线（最大收益 >= 10% 保底 5%、>= 5% 保底 2%、
    >= 3% 保底 0%）。
+3. ``BollUpperSellSubSignal``（兜底）：布林上轨止盈。当日日线布林上轨（前复权，盘前由
+   策略按“当天可卖出的持仓”算好，放在 ``strategy.boll_up``）被现价触及且当前收益为正
+   时全清；亏损不触发（下跌后的反弹假突破不清仓），取不到上轨（样本不足 / 前复权数据
+   未落地）也不触发。排在价格卖出之后，因此只在未触发止损、未达 10%/20% 止盈档、
+   未回撤、未跌破保底时生效（即 0 < 收益 < 10% 的兜底止盈）。
 
 减半产出 ``SELL``（部分卖出），其余卖出产出 ``CLEAR``（全清）。
 
@@ -21,7 +26,9 @@
 是否已减半由可卖量是否不足 ``fixed_size`` 推断，不另存标记。行业评级由
 ``SectorSellSubSignal`` 自持的 ``SectorSellSignal`` 实例取；大盘快照可用性由
 ``PriceSellSubSignal`` 自持的 ``MarketRiskOffSignal`` 取，用于决定止损档能否放宽。
-``PrioritySellSubSignal.on_tick`` 在跑子信号前统一更新历史最大收益（公共前置），供两子信号共用。
+``PrioritySellSubSignal.on_tick`` 在跑子信号前统一更新历史最大收益（公共前置），供各子信号共用。
+``BollUpperSellSubSignal`` 的当日上轨由策略盘前算好（见
+``near_ma_surge_strategy._refresh_boll_bands``），子信号只读不算。
 """
 
 from __future__ import annotations
@@ -290,6 +297,76 @@ class PriceSellSubSignal(SubSignal):
         return self._result
 
 
+class BollUpperSellSubSignal(SubSignal):
+    """单标的布林上轨止盈子信号（兜底）：现价触及当日上轨且有盈利 → 全清。
+
+    ``on_tick`` 按顺序判定（``prev`` 忽略，优先级组合内的独立判定支）：
+
+    - 开仓价与现价有效，且 ``strategy.boll_up`` 里有该标的当日上轨（策略盘前按
+      “当天可卖出的持仓”算好；取数失败 / 日线不足 ``window`` 根 / 前复权数据未落地
+      时为 0，即不可用）；
+    - 当前收益 > 0：价格在上轨之上但仍在亏损（下跌后的反弹假突破）不清仓；
+    - 现价 >= 上轨 → ``CLEAR`` 全清（可卖量），否则 NONE。
+
+    是“触及即卖”而非“上穿一次”：不留触发标记，重复触发由 T+1 卖出冻结量天然抑制
+    （全清委托发出后可卖量即为 0，后续 tick 不再重发）。
+    """
+
+    def __init__(self, vt_symbol: str, strategy: StrategyTemplate) -> None:
+        """构造函数：初始化本次判定结果与情绪上下文取值器。"""
+        super().__init__(vt_symbol, strategy)
+        self._result: SignalResult = SignalResult()
+        # 大盘 / 行业情绪判定器（自持）：仅用于命中时拼四项情绪上下文
+        self._market: MarketRiskOffSignal = MarketRiskOffSignal(strategy)
+        self._sector: SectorSellSignal = SectorSellSignal(strategy)
+
+    def on_tick(self, tick: TickData, prev: SignalResult) -> SignalResult:
+        """现价触及当日上轨且有盈利 → 全清，否则 NONE（prev 忽略）。"""
+        s = self.strategy
+        entry_price: float | None = s.entry_prices.get(self.vt_symbol, None)
+        boll_up: float = s.boll_up.get(self.vt_symbol, 0.0)
+        sellable: int = s.get_sellable(self.vt_symbol)
+        if (
+            not entry_price or entry_price <= 0
+            or not tick.last_price or boll_up <= 0
+            or sellable <= 0
+        ):
+            self._result = SignalResult()
+            return self._result
+
+        # 必须盈利才按上轨走：价格在轨上但仍在亏损时不卖（反弹假突破）
+        profit_pct: float = (tick.last_price - entry_price) / entry_price
+        if profit_pct <= 0 or tick.last_price < boll_up:
+            self._result = SignalResult()
+            return self._result
+
+        # 命中才拼情绪上下文，避免每 tick 拼串
+        market_level, market_score = self._market.market_values()
+        sector_name, sector_level, sector_score = self._sector.sector_values(self.vt_symbol)
+        context: str = format_sentiment_context(
+            market_level, market_score, sector_name, sector_level, sector_score
+        )
+        self._result = SignalResult(
+            type=SignalType.CLEAR,
+            volume=sellable,
+            price=tick.last_price - s.price_add,
+            reason=(
+                f"布林上轨止盈 现价 {tick.last_price:.2f} >= 上轨 {boll_up:.2f} "
+                f"收益 {profit_pct * 100:.2f}% {context}"
+            ),
+        )
+        return self._result
+
+    def on_bar(self, bar: BarData, prev: SignalResult) -> SignalResult:
+        """K线推送回调：本信号走 tick，此处不处理，原样返回 prev。"""
+        self._result = prev
+        return prev
+
+    def signal_result(self) -> SignalResult:
+        """返回 ``on_tick`` 已缓存的判定结果（零计算）。"""
+        return self._result
+
+
 class PriorityCompositeSubSignal(SubSignal):
     """优先级组合子信号：按序短路运行一组子信号，首个非 NONE 即返回。
 
@@ -343,13 +420,13 @@ class PriorityCompositeSubSignal(SubSignal):
 
 
 class SellSubSignal(PriorityCompositeSubSignal):
-    """卖出子信号：情绪卖出优先，其次价格卖出（优先级短路）。
+    """卖出子信号：情绪卖出优先，其次价格卖出，最后布林上轨兜底（优先级短路）。
 
-    优先级序：``SectorSellSubSignal``（情绪卖出）→ ``PriceSellSubSignal``（价格卖出）。
-    情绪命中即短路，价格卖出不跑。
+    优先级序：``SectorSellSubSignal``（情绪卖出）→ ``PriceSellSubSignal``（价格卖出）
+    → ``BollUpperSellSubSignal``（布林上轨止盈）。前序命中即短路，后续不跑。
     """
 
-    sub_factories = [SectorSellSubSignal, PriceSellSubSignal]
+    sub_factories = [SectorSellSubSignal, PriceSellSubSignal, BollUpperSellSubSignal]
 
 
 class SellAggregator(SignalAggregator):

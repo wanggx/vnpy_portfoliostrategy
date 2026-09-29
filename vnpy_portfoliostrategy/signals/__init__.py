@@ -5,8 +5,8 @@
 - ``buy_signals``：``WindowSurgeSubSignal`` / ``DayGainSubSignal`` / ``SurgeBuyOrSignal`` /
   ``SectorBuySubSignal`` / ``BuyAggregator``（拉升检测 OR + 大盘/行业情绪过滤）
 - ``sell_signals``：``SectorSellSubSignal`` / ``PriceSellSubSignal`` /
-  ``PriorityCompositeSubSignal`` / ``SellSubSignal`` / ``SellAggregator``
-  （情绪卖出优先 + 分档价格卖出，优先级短路）
+  ``BollUpperSellSubSignal`` / ``PriorityCompositeSubSignal`` / ``SellSubSignal`` /
+  ``SellAggregator``（情绪卖出优先 + 分档价格卖出 + 布林上轨兜底，优先级短路）
 - ``sentiment_signals``：``SectorBuySignal`` / ``SectorSellSignal`` / ``MarketRiskOffSignal``
   （行业可买 / 行业应卖 / 市场情绪共享依赖）
 """
@@ -26,6 +26,7 @@ from .buy_signals import (
     WindowSurgeSubSignal,
 )
 from .sell_signals import (
+    BollUpperSellSubSignal,
     PriceSellSubSignal,
     PriorityCompositeSubSignal,
     SectorSellSubSignal,
@@ -59,6 +60,7 @@ __all__ = [
     # sell
     "SectorSellSubSignal",
     "PriceSellSubSignal",
+    "BollUpperSellSubSignal",
     "PriorityCompositeSubSignal",
     "SellSubSignal",
     "SellAggregator",
