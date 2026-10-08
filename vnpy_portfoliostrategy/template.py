@@ -1,12 +1,162 @@
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from copy import copy
 from collections import defaultdict
 from typing import Any, cast
 
 from vnpy.trader.constant import Interval, Direction, Offset
-from vnpy.trader.object import BarData, TickData, OrderData, TradeData
+from vnpy.trader.object import BarData, TickData, OrderData, TradeData, AccountData
 
 from .base import EngineType
+
+
+# 资金/派生字段名：并入 get_variables 用于界面展示，但持久化时剔除（重启由账户事件重建）
+CONTEXT_FUND_FIELDS: tuple = (
+    "balance", "available", "frozen", "deployed_cash", "market_value", "pnl"
+)
+
+
+def _is_json_safe(value) -> bool:
+    """是否可 JSON 序列化（bool/int/float/str/None/list/dict 递归判定）。"""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return True
+    if isinstance(value, (list, tuple)):
+        return all(_is_json_safe(v) for v in value)
+    if isinstance(value, dict):
+        return all(isinstance(k, str) and _is_json_safe(v) for k, v in value.items())
+    return False
+
+
+class StrategyContext:
+    """组合策略运行上下文：聚合账户资金等通用状态，并提供 extra_data 扩展区。
+
+    作为 ``StrategyTemplate`` 的属性存在（``strategy.context``）。资金字段
+    （``balance / available / frozen``）由引擎在账户事件时同步；``deployed_cash`` /
+    ``market_value`` / ``pnl`` 为派生值，``refresh()`` 现算；``extra_data`` 为策略
+    独特变量（任意结构，JSON-safe 部分随策略持久化）。
+    """
+
+    def __init__(self, strategy: StrategyTemplate) -> None:
+        """构造函数：绑定所属策略。"""
+        self.strategy: StrategyTemplate = strategy
+
+        # 账户资金（引擎在账户事件时同步；重启重建）
+        self.account_id: str = ""
+        self.gateway_name: str = ""
+        self.balance: float = 0.0        # 总资产/权益
+        self.available: float = 0.0      # 可用资金
+        self.frozen: float = 0.0         # 冻结资金
+
+        # 派生值（refresh() 现算）
+        self.deployed_cash: float = 0.0  # 已占用资金：持仓成本 + 在途买单
+        self.market_value: float = 0.0   # 持仓市值（最新价 × 持仓量）
+        self.pnl: float = 0.0            # 浮动盈亏：市值 - 成本
+
+        # 最新价缓存（引擎 process_tick_event 时写入，仅运行时，不落盘）
+        self.last_prices: dict[str, float] = {}
+
+        # 策略独特变量扩展区（任意结构，JSON-safe 部分随策略持久化）
+        self.extra_data: dict = {}
+
+    def update_account(self, account: AccountData) -> None:
+        """用账户回报更新资金字段。"""
+        self.account_id = account.accountid
+        self.gateway_name = account.gateway_name
+        self.balance = account.balance
+        self.available = account.available
+        self.frozen = account.frozen
+
+    # ------------------------------------------------------------------
+    # 只读聚合（透传 strategy）
+    # ------------------------------------------------------------------
+    @property
+    def pos(self) -> dict:
+        """实际持仓（vt_symbol -> volume）。"""
+        return self.strategy.pos_data
+
+    @property
+    def orders(self) -> dict:
+        """委托缓存（vt_orderid -> OrderData）。"""
+        return self.strategy.orders
+
+    @property
+    def active_orderids(self) -> set:
+        """活动委托号集合。"""
+        return self.strategy.active_orderids
+
+    def get_pos(self, vt_symbol: str) -> int:
+        """查询当前持仓。"""
+        return self.strategy.get_pos(vt_symbol)
+
+    def get_sellable(self, vt_symbol: str) -> int:
+        """查询可卖量。"""
+        return self.strategy.get_sellable(vt_symbol)
+
+    def get_pos_price(self, vt_symbol: str) -> float:
+        """查询经纪商持仓均价。"""
+        return self.strategy.get_pos_price(vt_symbol)
+
+    def has_active_order(self, vt_symbol: str) -> bool:
+        """该标的是否存在在途（未成交/部分成交）委托。"""
+        for vt_orderid in self.active_orderids:
+            order = self.orders.get(vt_orderid)
+            if order is not None and order.vt_symbol == vt_symbol:
+                return True
+        return False
+
+    # ------------------------------------------------------------------
+    # 派生字段现算
+    # ------------------------------------------------------------------
+    def refresh(self) -> None:
+        """现算派生字段：deployed_cash / market_value / pnl。"""
+        s = self.strategy
+        deployed: float = 0.0
+        market_value: float = 0.0
+        cost: float = 0.0
+
+        for vt_symbol, position in s.pos_data.items():
+            if position <= 0:
+                continue
+            entry: float = getattr(s, "entry_prices", {}).get(vt_symbol, 0.0)
+            entry = entry or s.get_pos_price(vt_symbol)
+            cost += position * entry
+            last: float = self.last_prices.get(vt_symbol, 0.0) or entry
+            market_value += position * last
+
+        # 在途买单未成交部分占用（已成交部分已计入持仓）
+        for vt_orderid in s.active_orderids:
+            order = s.orders.get(vt_orderid)
+            if order is None or order.direction != Direction.LONG:
+                continue
+            remaining: float = max(order.volume - order.traded, 0)
+            deployed += remaining * order.price
+
+        self.deployed_cash = deployed + cost
+        self.market_value = market_value
+        self.pnl = market_value - cost
+
+    # ------------------------------------------------------------------
+    # 展示与持久化
+    # ------------------------------------------------------------------
+    def fund_fields(self) -> dict:
+        """资金与派生字段快照（供界面展示；不入持久化）。"""
+        self.refresh()
+        return {
+            "balance": self.balance,
+            "available": self.available,
+            "frozen": self.frozen,
+            "deployed_cash": self.deployed_cash,
+            "market_value": self.market_value,
+            "pnl": self.pnl,
+        }
+
+    def serializable_extra_data(self) -> dict:
+        """extra_data 的 JSON-safe 子集（随策略落盘）。"""
+        return {
+            key: value for key, value in self.extra_data.items()
+            if _is_json_safe(value)
+        }
 
 
 class StrategyTemplate(ABC):
@@ -55,6 +205,9 @@ class StrategyTemplate(ABC):
         self.orders: dict[str, OrderData] = {}
         self.active_orderids: set[str] = set()
 
+        # 策略运行上下文：聚合资金 + extra_data，统一供信号/策略逻辑访问
+        self.context: StrategyContext = StrategyContext(self)
+
         # 复制变量名列表，插入默认变量内容
         self.variables: list = copy(self.variables)
         self.variables.insert(0, "inited")
@@ -100,10 +253,16 @@ class StrategyTemplate(ABC):
         return strategy_parameters
 
     def get_variables(self) -> dict:
-        """查询策略变量"""
+        """查询策略变量
+
+        除 ``variables`` 名单外，并入资金/派生字段（仅展示）与 extra_data 的
+        JSON-safe 部分（随策略持久化）；资金字段在持久化时由引擎剔除。
+        """
         strategy_variables: dict = {}
         for name in self.variables:
             strategy_variables[name] = getattr(self, name)
+        strategy_variables.update(self.context.fund_fields())
+        strategy_variables["extra_data"] = self.context.serializable_extra_data()
         return strategy_variables
 
     def get_data(self) -> dict:

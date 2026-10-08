@@ -222,7 +222,7 @@ class SectorBuySubSignal(SubSignal):
     def __init__(self, vt_symbol: str, strategy: StrategyTemplate) -> None:
         """构造函数：持有行业情绪判定器、本次判定结果与大盘拦截的按日去重标记。"""
         super().__init__(vt_symbol, strategy)
-        self._sector: SectorBuySignal = SectorBuySignal(strategy)
+        self._sector: SectorBuySignal = SectorBuySignal(self.strategy)
         self._result: SignalResult = SignalResult()
         # 大盘拦截消息已推送的日期（YYYYMMDD）：大盘拦截可能持续整日、每 tick 都命中，
         # 按日去重避免同一标的反复刷日志 / 企微
@@ -313,10 +313,73 @@ class SectorBuySubSignal(SubSignal):
         return self._result
 
 
-class BuyAggregator(SignalAggregator):
-    """买入总信号：按 vt_symbol 聚合拉升检测 + 行业过滤子信号链，分发 tick、取链终态结果。
+class CashGateSubSignal(SubSignal):
+    """单标的资金上限子信号（链尾）：前序有 BUY 意向才做资金校验。
 
-    链序：``SurgeBuyOrSignal``（拉升检测 OR 组合）→ ``SectorBuySubSignal``（行业过滤）。
+    ``on_tick`` 见 ``prev`` 为 BUY 才校验本策略总占用资金（``context.deployed_cash`` =
+    持仓成本 + 在途买单）加上本笔买入金额是否超过 ``max_cash``：
+
+    - 超限 → 否定为 NONE（不发买单），计数 + 写日志 + 推企微提示，并标记 ``entered``
+      防止后续 tick 重复告警；
+    - 未超限 → 原样放行 ``prev`` 的 BUY（不补 reason，资金是总量闸门而非准入条件）。
+
+    ``prev`` 非 BUY 时直接返回 NONE（短路，不查资金）。
     """
 
-    sub_factories = [SurgeBuyOrSignal, SectorBuySubSignal]
+    def __init__(self, vt_symbol: str, strategy: StrategyTemplate) -> None:
+        """构造函数：初始化本次判定结果。"""
+        super().__init__(vt_symbol, strategy)
+        self._result: SignalResult = SignalResult()
+
+    def on_tick(self, tick: TickData, prev: SignalResult) -> SignalResult:
+        """前序有 BUY 意向才校验资金上限；超限则否定+告警，否则放行。"""
+        if prev.type != SignalType.BUY:
+            self._result = SignalResult()
+            return self._result
+
+        s = self.strategy
+        s.context.refresh()
+        deployed: float = s.context.deployed_cash
+        needed: float = prev.price * prev.volume
+
+        if deployed + needed > s.max_cash:
+            self._alert_cash_short(prev)
+            s.entered.add(self.vt_symbol)
+            s.put_event()
+            self._result = SignalResult()
+            return self._result
+
+        self._result = prev
+        return self._result
+
+    def _alert_cash_short(self, prev: SignalResult) -> None:
+        """资金不足告警：计数 + 写日志 + 推企微（每次跳过都是去重的独立事件）。"""
+        s = self.strategy
+        s.cash_short_count += 1
+        name: str = s._get_symbol_name(self.vt_symbol)
+        msg: str = (
+            f"资金不足，跳过买入 {self.vt_symbol}({name}) "
+            f"下单价 {prev.price:.2f} 已占用资金 {s.context.deployed_cash:.2f} "
+            f"策略资金上限 {s.max_cash:.0f}（当日已跳过 {s.cash_short_count} 笔）"
+        )
+        s.write_log(msg)
+        s.send_wecom(msg)
+
+    def on_bar(self, bar: BarData, prev: SignalResult) -> SignalResult:
+        """K线推送回调：本信号走 tick，此处不处理，原样返回 prev。"""
+        self._result = prev
+        return prev
+
+    def signal_result(self) -> SignalResult:
+        """返回 ``on_tick`` 已缓存的判定结果（零计算）。"""
+        return self._result
+
+
+class BuyAggregator(SignalAggregator):
+    """买入总信号：按 vt_symbol 聚合拉升检测 + 行业过滤 + 资金上限子信号链。
+
+    链序：``SurgeBuyOrSignal``（拉升检测 OR 组合）→ ``SectorBuySubSignal``（行业过滤）
+    → ``CashGateSubSignal``（资金上限）。
+    """
+
+    sub_factories = [SurgeBuyOrSignal, SectorBuySubSignal, CashGateSubSignal]

@@ -26,7 +26,7 @@ from vnpy.trader.object import BarData, TickData
 if TYPE_CHECKING:
     # 仅供类型标注用（from __future__ import annotations 使标注不求值），
     # 运行时不需要，避免循环导入。
-    from vnpy_portfoliostrategy.template import StrategyTemplate
+    from vnpy_portfoliostrategy.template import StrategyTemplate, StrategyContext
 
 
 class SignalType(Enum):
@@ -60,10 +60,21 @@ class SubSignal:
     决定保留/否定/改写）；所有计算与副作用都在此完成，``signal_result`` 仅返回缓存结果。
     """
 
-    def __init__(self, vt_symbol: str, strategy: StrategyTemplate) -> None:
-        """构造函数：绑定标的与所属策略。"""
+    def __init__(
+        self, vt_symbol: str, strategy: StrategyTemplate | StrategyContext
+    ) -> None:
+        """构造函数：绑定标的与策略运行上下文。
+
+        ``strategy`` 既可传 ``StrategyTemplate``（老写法，内部取 ``.context``），
+        也可直接传 ``StrategyContext``（推荐）；统一持有 ``self.context``，
+        ``self.strategy`` 作为兼容别名保留。
+        """
         self.vt_symbol: str = vt_symbol
-        self.strategy: StrategyTemplate = strategy
+        # 兼容：传入 StrategyTemplate 时取其 .context；传入 StrategyContext 时直接用
+        if hasattr(strategy, "context"):
+            strategy = strategy.context
+        self.context: StrategyContext = strategy
+        self.strategy: StrategyTemplate = self.context.strategy
 
     def on_tick(self, tick: TickData, prev: SignalResult) -> SignalResult:
         """处理 tick，更新内部状态；返回本子信号产出（可基于 prev）。"""
@@ -87,8 +98,9 @@ class SignalAggregator:
     链终态缓存。子信号在首次见到 vt_symbol 时按需创建，退订时由 ``remove`` 清理。
     """
 
-    # 子类覆盖：有序子信号工厂列表，按序判定（前序结果传入后序）
-    sub_factories: list[Callable[[str, StrategyTemplate], SubSignal]] = []
+    # 子类覆盖：有序子信号工厂列表，按序判定（前序结果传入后序）；
+    # 工厂签名 (vt_symbol, context) -> SubSignal，context 为 StrategyContext
+    sub_factories: list[Callable[[str, StrategyContext], SubSignal]] = []
 
     def __init__(self, strategy: StrategyTemplate) -> None:
         """构造函数：持有策略引用并初始化子信号映射与结果缓存。"""
@@ -129,6 +141,9 @@ class SignalAggregator:
         """取子信号列表，不存在则按 sub_factories 逐个创建并登记。"""
         subs = self._subs.get(vt_symbol)
         if subs is None:
-            subs = [factory(vt_symbol, self.strategy) for factory in self.sub_factories]
+            subs = [
+                factory(vt_symbol, self.strategy.context)
+                for factory in self.sub_factories
+            ]
             self._subs[vt_symbol] = subs
         return subs

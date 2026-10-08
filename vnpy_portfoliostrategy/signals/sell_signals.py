@@ -65,9 +65,9 @@ class SectorSellSubSignal(SubSignal):
         """构造函数：持有行业应卖判定器与本次判定结果。"""
         super().__init__(vt_symbol, strategy)
         # 行业应卖判定器（自持，卖出侧独立于买入侧的 SectorBuySignal）
-        self._sector: SectorSellSignal = SectorSellSignal(strategy)
+        self._sector: SectorSellSignal = SectorSellSignal(self.strategy)
         # 大盘情绪判定器（自持）：仅用于消息里带上大盘评级与分数
-        self._market: MarketRiskOffSignal = MarketRiskOffSignal(strategy)
+        self._market: MarketRiskOffSignal = MarketRiskOffSignal(self.strategy)
         self._result: SignalResult = SignalResult()
 
     def on_tick(self, tick: TickData, prev: SignalResult) -> SignalResult:
@@ -132,9 +132,9 @@ class PriceSellSubSignal(SubSignal):
         super().__init__(vt_symbol, strategy)
         self._result: SignalResult = SignalResult()
         # 大盘情绪判定器（自持）：取快照可用性
-        self._market: MarketRiskOffSignal = MarketRiskOffSignal(strategy)
+        self._market: MarketRiskOffSignal = MarketRiskOffSignal(self.strategy)
         # 行业情绪判定器（自持）：取该标的行业评级是否可用
-        self._sector: SectorSellSignal = SectorSellSignal(strategy)
+        self._sector: SectorSellSignal = SectorSellSignal(self.strategy)
 
     def on_tick(self, tick: TickData, prev: SignalResult) -> SignalResult:
         """价格卖出判定，按优先级返回首个命中结果（prev 忽略）。"""
@@ -319,8 +319,8 @@ class BollUpperSellSubSignal(SubSignal):
         super().__init__(vt_symbol, strategy)
         self._result: SignalResult = SignalResult()
         # 大盘 / 行业情绪判定器（自持）：仅用于命中时拼四项情绪上下文
-        self._market: MarketRiskOffSignal = MarketRiskOffSignal(strategy)
-        self._sector: SectorSellSignal = SectorSellSignal(strategy)
+        self._market: MarketRiskOffSignal = MarketRiskOffSignal(self.strategy)
+        self._sector: SectorSellSignal = SectorSellSignal(self.strategy)
 
     def on_tick(self, tick: TickData, prev: SignalResult) -> SignalResult:
         """现价触及当日上轨且收益 >= BOLL_MIN_PROFIT_PCT → 全清，否则 NONE（prev 忽略）。"""

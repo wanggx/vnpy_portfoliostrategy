@@ -18,6 +18,7 @@ from .base import (
     SubSignal,
 )
 from .buy_signals import (
+    CashGateSubSignal,
     SectorBuySubSignal,
     BuyAggregator,
     DayGainSubSignal,
@@ -56,6 +57,7 @@ __all__ = [
     "OrCompositeSubSignal",
     "SurgeBuyOrSignal",
     "SectorBuySubSignal",
+    "CashGateSubSignal",
     "BuyAggregator",
     # sell
     "SectorSellSubSignal",

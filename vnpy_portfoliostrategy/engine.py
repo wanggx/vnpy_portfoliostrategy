@@ -22,13 +22,15 @@ from vnpy.trader.object import (
     TradeData,
     BarData,
     ContractData,
-    PositionData
+    PositionData,
+    AccountData
 )
 from vnpy.trader.event import (
     EVENT_TICK,
     EVENT_ORDER,
     EVENT_TRADE,
-    EVENT_POSITION
+    EVENT_POSITION,
+    EVENT_ACCOUNT
 )
 from vnpy.trader.constant import (
     Direction,
@@ -49,7 +51,7 @@ from .base import (
     EngineType
 )
 from .locale import _
-from .template import StrategyTemplate
+from .template import StrategyTemplate, CONTEXT_FUND_FIELDS
 
 
 class StrategyEngine(BaseEngine):
@@ -105,6 +107,7 @@ class StrategyEngine(BaseEngine):
         self.event_engine.register(EVENT_ORDER, self.process_order_event)
         self.event_engine.register(EVENT_TRADE, self.process_trade_event)
         self.event_engine.register(EVENT_POSITION, self.process_position_event)
+        self.event_engine.register(EVENT_ACCOUNT, self.process_account_event)
 
         log_engine: LogEngine = self.main_engine.get_engine("log")
         log_engine.register_log(EVENT_PORTFOLIO_LOG)
@@ -139,6 +142,7 @@ class StrategyEngine(BaseEngine):
 
         for strategy in strategies:
             if strategy.inited:
+                strategy.context.last_prices[tick.vt_symbol] = tick.last_price
                 self.call_strategy_func(strategy, strategy.on_tick, tick)
 
     def process_order_event(self, event: Event) -> None:
@@ -208,6 +212,33 @@ class StrategyEngine(BaseEngine):
                 position.vt_symbol, position.volume, position.yd_volume, position.price
             )
             self.put_strategy_event(strategy)
+
+    def process_account_event(self, event: Event) -> None:
+        """账户数据推送：同步资金到订阅了该网关标的的策略 context"""
+        account: AccountData = event.data
+
+        for strategy in self.strategies.values():
+            if not strategy.inited:
+                continue
+            if self._strategy_uses_gateway(strategy, account.gateway_name):
+                strategy.context.update_account(account)
+                self.put_strategy_event(strategy)
+
+    def _strategy_uses_gateway(
+        self, strategy: StrategyTemplate, gateway_name: str
+    ) -> bool:
+        """策略是否订阅了该网关的标的"""
+        for vt_symbol in strategy.vt_symbols:
+            contract: ContractData | None = self.main_engine.get_contract(vt_symbol)
+            if contract and contract.gateway_name == gateway_name:
+                return True
+        return False
+
+    def sync_accounts(self, strategy: StrategyTemplate) -> None:
+        """初始化时从缓存账户兜底同步资金到策略 context"""
+        for account in self.main_engine.get_all_accounts():
+            if self._strategy_uses_gateway(strategy, account.gateway_name):
+                strategy.context.update_account(account)
 
     def send_order(
         self,
@@ -685,6 +716,11 @@ class StrategyEngine(BaseEngine):
                 else:
                     setattr(strategy, name, value)
 
+            # 恢复策略独特变量（extra_data 的 JSON-safe 部分）
+            extra_data: object | None = data.get("extra_data")
+            if isinstance(extra_data, dict):
+                strategy.context.extra_data.update(extra_data)
+
         # 订阅行情
         for vt_symbol in strategy.vt_symbols:
             contract: ContractData | None = self.main_engine.get_contract(vt_symbol)
@@ -701,6 +737,9 @@ class StrategyEngine(BaseEngine):
 
         # T+1 模式：同步经纪商持仓的昨/今仓
         self.init_t1_position(strategy)
+
+        # 兜底同步账户资金到 context
+        self.sync_accounts(strategy)
 
         # 推送策略事件通知初始化完成状态
         strategy.inited = True
@@ -829,6 +868,9 @@ class StrategyEngine(BaseEngine):
         for name in {
             "yd_pos_data", "td_pos_data", "sell_frozen_data", "position_synced"
         }:
+            data.pop(name, None)
+        # 资金/派生字段不落盘（重启由账户事件重建）
+        for name in CONTEXT_FUND_FIELDS:
             data.pop(name, None)
 
         self.strategy_data[strategy.strategy_name] = data

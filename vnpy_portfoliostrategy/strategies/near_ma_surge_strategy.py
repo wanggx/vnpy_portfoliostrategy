@@ -55,9 +55,9 @@ class NearMaSurgeStrategy(StrategyTemplate):
     未达 10%/20% 止盈档、未回撤、未跌破保底时生效（即 5% ≤ 收益 < 10%）。
 
     资金约束：本策略**总占用资金**（持仓成本 + 在途买单）不超过 ``max_cash`` 元上限，
-    单笔买入仍是 ``fixed_size`` 股，不按单笔金额限制。买入前用 ``_deployed_cash()``
-    汇总持仓成本与在途买单占用，超出上限时跳过该笔买入并推企微提示；跳过即标记
-    entered，同一标的当日不会重复触发，不刷屏。
+    单笔买入仍是 ``fixed_size`` 股，不按单笔金额限制。资金校验由买入链尾的
+    ``CashGateSubSignal`` 完成（刷新 ``context.deployed_cash`` = 持仓成本 + 在途买单，
+    超上限则否定买入并推企微提示）；跳过即标记 entered，同一标的当日不会重复触发，不刷屏。
 
     信号架构分两层：买入/卖出各一个总信号（``BuyAggregator`` / ``SellAggregator``），
     内部按 ``vt_symbol`` 维护子信号映射并分发行情；子信号经 ``signal_result()`` 返回
@@ -411,19 +411,9 @@ class NearMaSurgeStrategy(StrategyTemplate):
 
             # 防重复下单：该标的已有在途委托（未成交/部分成交）时不再发新买单，
             # 等其终结后再由信号决定；同时保证单标的仓位不会超过 fixed_size
-            if self._has_active_order(vt_symbol):
+            if self.context.has_active_order(vt_symbol):
                 self.write_log(f"{vt_symbol}({name}) 已有在途委托，跳过重复买入")
                 self.entered.add(vt_symbol)
-                return
-
-            # 资金约束：本策略总占用资金（持仓成本 + 在途买单）不超过 max_cash，
-            # 超出则跳过本次买入，并标记 entered 避免后续 tick 反复告警
-            deployed: float = self._deployed_cash()
-            needed: float = result.price * result.volume
-            if deployed + needed > self.max_cash:
-                self._on_insufficient_cash(vt_symbol, name, result.price, deployed)
-                self.entered.add(vt_symbol)
-                self.put_event()
                 return
 
             self.buy(vt_symbol, result.price, result.volume, mark=result.reason)
@@ -440,59 +430,6 @@ class NearMaSurgeStrategy(StrategyTemplate):
             self.write_log(msg)
             self.send_wecom(msg)
             self.put_event()
-
-    def _has_active_order(self, vt_symbol: str) -> bool:
-        """该标的是否存在在途（未成交/部分成交）委托。
-
-        依据策略自身的委托状态判断：``active_orderids`` 是下单时登记、委托终结
-        （全部成交/撤单/拒单）时摘除的活动委托号集合，配合 ``orders`` 缓存反查标的。
-        买入分支用它在发出新买单前确认没有未了结的旧买单，防止重复下单。
-        """
-        for vt_orderid in self.active_orderids:
-            order = self.orders.get(vt_orderid)
-            if order is not None and order.vt_symbol == vt_symbol:
-                return True
-        return False
-
-    def _deployed_cash(self) -> float:
-        """本策略当前已占用资金：持仓成本 + 在途买单（未成交部分）占用。
-
-        持仓成本按开仓价 × 持仓量计（缺开仓价时用经纪商持仓均价兜底）；在途买单
-        按剩余未成交量 × 委托价计（已成交部分已计入持仓，不重复计）。
-        """
-        total: float = 0.0
-        for vt_symbol, pos in self.pos_data.items():
-            if pos <= 0:
-                continue
-            price: float = (
-                self.entry_prices.get(vt_symbol, 0.0)
-                or self.get_pos_price(vt_symbol)
-            )
-            total += pos * price
-        for vt_orderid in self.active_orderids:
-            order = self.orders.get(vt_orderid)
-            if order is None or order.direction != Direction.LONG:
-                continue
-            remaining: float = max(order.volume - order.traded, 0)
-            total += remaining * order.price
-        return total
-
-    def _on_insufficient_cash(
-        self, vt_symbol: str, name: str, price: float, deployed: float
-    ) -> None:
-        """资金不足跳过买入：计数 + 写日志 + 推企微提示。
-
-        每次跳过都是已去重的独立事件（跳过即标记 entered，同一标的当日不会重复
-        触发），因此每次都推企微，不会刷屏。
-        """
-        self.cash_short_count += 1
-        msg: str = (
-            f"资金不足，跳过买入 {vt_symbol}({name}) "
-            f"下单价 {price:.2f} 已占用资金 {deployed:.2f} "
-            f"策略资金上限 {self.max_cash:.0f}（当日已跳过 {self.cash_short_count} 笔）"
-        )
-        self.write_log(msg)
-        self.send_wecom(msg)
 
     def _fmt_buy_msg(self, vt_symbol: str, name: str, result: SignalResult) -> str:
         """拼接买入信号消息（日志/企微复用）"""
