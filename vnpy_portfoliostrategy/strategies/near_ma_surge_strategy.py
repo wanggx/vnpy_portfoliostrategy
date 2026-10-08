@@ -74,7 +74,7 @@ class NearMaSurgeStrategy(StrategyTemplate):
 
     # 交易参数
     fixed_size: int = 500
-    price_add: float = 0.0
+    price_add: float = 0.05
     # T+1 开关（A 股现货 True：仅可卖昨仓；期货 False：T+0）
     t1: bool = True
 
@@ -167,7 +167,9 @@ class NearMaSurgeStrategy(StrategyTemplate):
         # 累计触发拉升买入次数
         self.surge_count: int = 0
 
-        # 本轮已触发买入的标的，避免同一波拉升重复下单（含行业拦截也标记）
+        # 本轮已触发买入的标的，避免同一波拉升重复下单（含行业拦截也标记）。
+        # 只在 update_trade 平仓归零、或 refresh_universe 退订时清除；经纪商 0 仓
+        # 回报（尤其买入委托在途未成交时）不得清空它，否则下一 tick 会重复触发下单
         self.entered: set[str] = set()
 
         # 卖出委托监控（通用件，仅运行时状态，不持久化）：全部成交/撤单/拒单即摘除，
@@ -297,11 +299,13 @@ class NearMaSurgeStrategy(StrategyTemplate):
                 self._sync_tracking_state()
             self.entered.add(vt_symbol)
         else:
+            # 0 仓回报只清开仓追踪，不清 entered：entered 是"本轮已触发买入"标记，
+            # 只在 update_trade 平仓归零时清除。在途买入未成交时经纪商可能仍报 0 仓，
+            # 若这里清掉 entered，下一 tick 拉升信号会重复触发下单 + 重复推送
             if vt_symbol in self.entry_prices or vt_symbol in self.max_profit_pct:
                 self.entry_prices.pop(vt_symbol, None)
                 self.max_profit_pct.pop(vt_symbol, None)
                 self._sync_tracking_state()
-            self.entered.discard(vt_symbol)
 
     def _sync_tracking_state(self) -> None:
         """持久化策略变量（开仓价 / 最大收益 / 止损冷却日）到 portfolio_strategy_data.json"""
@@ -507,12 +511,13 @@ class NearMaSurgeStrategy(StrategyTemplate):
         # 委托终结（全部成交/撤单/拒单）即去掉卖出委托监控
         self.sell_monitor.update_order(order)
 
-        # 过滤 SUBMITTING/NOTTRADED 等中间状态噪声
+        # 只推终态；部分成交(PARTTRADED)由 update_trade 的成交通知逐笔覆盖，
+        # 不再重复推委托通知，避免分多笔成交的委托刷屏
         if order.status not in {
-            Status.ALLTRADED, Status.PARTTRADED,
-            Status.CANCELLED, Status.REJECTED
+            Status.ALLTRADED, Status.CANCELLED, Status.REJECTED
         }:
             return
+
         name: str = self._get_symbol_name(order.vt_symbol)
         direction: str = order.direction.value if order.direction else ""
         offset: str = order.offset.value if order.offset else ""
