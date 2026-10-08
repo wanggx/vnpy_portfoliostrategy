@@ -129,13 +129,13 @@
       <!-- 门3 买入前置 -->
       <g transform="translate(50,370)">
         <rect class="node-d" width="340" height="70" rx="10"/>
-        <text x="170" y="25" text-anchor="middle"><tspan x="170">③ 买入前置全部通过？</tspan><tspan x="170" dy="18">未触发过 entered · 不在冷却期</tspan><tspan x="170" dy="18">价格有效</tspan></text>
+        <text x="170" y="25" text-anchor="middle"><tspan x="170">③ 买入前置全部通过？</tspan><tspan x="170" dy="18">未触发过 entered · 不在离场冷却期</tspan><tspan x="170" dy="18">价格有效</tspan></text>
       </g>
       <line class="arrow" x1="392" y1="405" x2="512" y2="405" marker-end="url(#arB)"/>
       <text class="t-label" x="452" y="398" text-anchor="middle">否</text>
       <g transform="translate(520,370)">
         <rect class="node" width="480" height="70" rx="10"/>
-        <text x="240" y="32" text-anchor="middle"><tspan x="240">忽略：已触发过 / 冷却期内 / 价格无效</tspan><tspan x="240" dy="18">—— 防同一波重复下单、防反复止损</tspan></text>
+        <text x="240" y="32" text-anchor="middle"><tspan x="240">忽略：已触发过 / 离场冷却期内 / 价格无效</tspan><tspan x="240" dy="18">—— 防同一波重复下单、防反复止损、防当天卖出后再买回</tspan></text>
       </g>
       <line class="arrow" x1="220" y1="440" x2="220" y2="472" marker-end="url(#arB)"/>
 
@@ -200,7 +200,7 @@
       <text class="t-label" x="452" y="968" text-anchor="middle">注</text>
       <g transform="translate(520,940)">
         <rect class="node-n" width="480" height="70" rx="10"/>
-        <text class="t-note" x="240" y="32" text-anchor="middle"><tspan x="240">冷却：亏损离场后记录止损日 D</tspan><tspan x="240" dy="18">D ~ D+COOLDOWN_DAYS 天不再买入该标的</tspan></text>
+        <text class="t-note" x="240" y="32" text-anchor="middle"><tspan x="240">冷却：任何离场当天都禁买（登记禁入截止日）</tspan><tspan x="240" dy="18">亏损离场额外锁 D ~ D+COOLDOWN_DAYS 天</tspan></text>
       </g>
     </svg>
   </div>
@@ -365,7 +365,7 @@
         <text class="t-title" x="475" y="28" text-anchor="middle">命中后处理（③～⑨ 任一档命中都执行）</text>
         <text x="22" y="52">① 下单：全清 → 可卖量；减半 → 半仓向上取整到 100 股；价格 = 现价 − price_add</text>
         <text x="22" y="74">② 日志 + 企业微信：卖出信号 代码(名称) &lt;原因&gt; 卖出价格 … 当前收益 … 最大收益 …（原因里含大盘/行业四项情绪）</text>
-        <text x="22" y="96">③ CLEAR 且亏损 → 记录止损日并立即落盘（冷却）；止盈离场不加冷却</text>
+        <text x="22" y="96">③ 任何离场（止损/情绪/止盈/减半）都登记禁入截止日 cooldown_dates 并落盘：离场当天一律禁买，亏损离场额外锁 COOLDOWN_DAYS 天</text>
         <text x="22" y="115">④ 平仓归零 → 清理 entry_prices / max_profit_pct，释放 entered</text>
       </g>
     </svg>
@@ -393,7 +393,7 @@
       <tr><td><code>TIER_HIGH_PCT</code> / <code>TIER_LOW_PCT</code> / <code>TIER_BREAKEVEN_PCT</code></td><td>10% / 5% / 3%</td><td>保底分档触发线（对应保底 5% / 2% / 0%）</td></tr>
       <tr><td><code>boll_window</code> / <code>boll_dev</code></td><td>20 / 2.0</td><td>日线布林上轨（前复权 <code>dividend_type="front"</code>）：盘前按"当天可卖出的持仓"算 20 日 MA + 2×σ；盘中触及且收益 ≥ 5% → 全清；排在价格档之后，故实际生效区间是 5% ≤ 收益 &lt; 10%</td></tr>
       <tr><td><code>BOLL_MIN_PROFIT_PCT</code></td><td>5%</td><td>布林上轨止盈的收益门槛：不足不卖（含亏损，挡反弹假突破；也避免只赚一两点就离场）</td></tr>
-      <tr><td><code>COOLDOWN_DAYS</code></td><td>2</td><td>亏损离场后记录止损日 D，D ~ D+2 天不再买入该标的</td></tr>
+      <tr><td><code>COOLDOWN_DAYS</code></td><td>2</td><td>任何离场当天都禁买该标的；亏损离场（成交价低于开仓价）额外锁 D ~ D+2 天</td></tr>
     </table>
 
     <h3>情绪数据（vnpy_marketsentiment）</h3>
@@ -416,12 +416,13 @@
       所以所有卖出规则最早从<b>次日</b>生效，止监管不了第一天的下跌与隔夜跳空 ——
       首日敞口只能靠买入端（买不买、买多少）控制。
     </p>
-    <h3>2. 亏损离场的冷却期</h3>
+    <h3>2. 离场后的买入禁入（冷却）</h3>
     <p class="hint" style="margin-bottom:0">
-      清仓且亏损时记录<b>止损日</b>到 <code>cooldown_dates</code>（随
-      <code>portfolio_strategy_data.json</code> 持久化，重启不丢），止损日起
-      <code>COOLDOWN_DAYS</code> 个自然日内不再买入该标的，用来堵住 T+1 下
-      "清仓 → 当天买回 → 次日再清" 的日频循环。止盈离场不加冷却。
+      任何离场（止损 / 情绪离场 / 止盈 / 减半）成交后向 <code>cooldown_dates</code> 写入
+      <b>禁入截止日</b>（随 <code>portfolio_strategy_data.json</code> 持久化，重启不丢）：
+      <b>离场当天一律不再买入</b>该标的；若为<b>亏损离场</b>（成交价低于开仓价）则额外再锁
+      <code>COOLDOWN_DAYS</code> 个自然日，用来堵住 T+1 下
+      "清仓 → 当天买回 → 次日再清" 的日频循环。
     </p>
   </div>
 
@@ -458,9 +459,10 @@
       L5 --&gt;|是| C6[全清: 跌破保底]
       L5 --&gt;|否| H[继续持有]
     end
-    C1 --&gt; R{清仓且亏损?}
+    C1 --&gt; R{离场成交（任何档）}
     C2 --&gt; R
-    R --&gt;|是| CO[记录止损日, COOLDOWN_DAYS 天内不再买入]</pre>
+    R --&gt;|止损/情绪（亏损）| CO[登记禁入截止日 D+COOLDOWN_DAYS]
+    R --&gt;|止盈/减半| CO2[登记禁入截止日 D（仅当天）]</pre>
     </details>
   </div>
 

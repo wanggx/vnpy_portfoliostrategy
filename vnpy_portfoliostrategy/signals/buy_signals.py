@@ -13,8 +13,8 @@
    行业需中性以上（不含中性）。达标则保留 BUY 并把大盘 / 行业评级补进 reason；行业不达标
    则记拦截日志 / 企微 + ``entered.add``，否定为 NONE（短路后续子信号）。
 
-需要持久化的全局状态（``entered`` 去重集合、标的池）经 ``self.strategy`` 访问；
-子信号只持有价格窗口、行业判定器实例等运行时状态。
+需要持久化的全局状态（``entered`` 去重集合、``cooldown_dates`` 离场冷却、标的池）经
+``self.strategy`` 访问；子信号只持有价格窗口、行业判定器实例等运行时状态。
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ if TYPE_CHECKING:
 
 
 def _check_buyable_context(s, vt_symbol: str, tick: TickData) -> bool:
-    """买入检测公共前置：当日池内、未 entered、价格有效、不在冷却期才允许检测。
+    """买入检测公共前置：当日池内、未 entered、价格有效、不在离场冷却期才允许检测。
 
     返回 True 表示可继续检测；False 表示不满足前置（子信号应返回 NONE）。
     抽出为公共函数，供窗口拉升与昨收涨幅两个子信号复用，避免重复。
@@ -49,8 +49,8 @@ def _check_buyable_context(s, vt_symbol: str, tick: TickData) -> bool:
         return False
     if not tick.last_price or tick.last_price <= 0:
         return False
-    # 亏损离场冷却期内不再买入（策略持久化的是止损日，窗口按 COOLDOWN_DAYS 现算），
-    # 避免"清仓→再买→再清"反复止损
+    # 买入禁入期内不再买入（策略存的是禁入截止日）：任何离场当天都禁买，
+    # 亏损离场还额外锁 COOLDOWN_DAYS 个自然日
     if s.is_buy_cooldown(vt_symbol, tick.datetime.strftime("%Y%m%d")):
         return False
     return True

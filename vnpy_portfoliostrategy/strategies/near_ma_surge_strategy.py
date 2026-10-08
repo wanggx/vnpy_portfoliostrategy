@@ -45,8 +45,13 @@ class NearMaSurgeStrategy(StrategyTemplate):
     不在岗时全天 2% 不放宽）、收益达 clear_profit_pct(默认 20%) 清仓、达
     half_profit_pct(默认 10%) 仓位减半（剩余可卖量不足 fixed_size 后不再减半）、
     回撤超过 10% 卖出，以及最大收益 >= 10% 保底 5%、>= 5% 保底 2%、>= 3% 不赔钱的
-    保底收益线。亏损离场（止损 / 情绪离场）后记录止损日，该标的在止损日起
-    ``COOLDOWN_DAYS`` 个自然日的冷却期内不再买入，避免"清仓→再买→再清"的反复止损。
+    保底收益线。**离场冷却**：任何标的当天有卖出成交（止损 / 情绪离场 / 清仓止盈 /
+    回撤 / 保底 / 布林上轨 / 减半）即登记买入**禁入截止日**（``cooldown_dates``，随策略
+    持久化，盘中重启当天仍生效）——**当天一律不再买入**（清仓后价格继续走高、昨收涨幅
+    仍达标也不回头）；亏损离场（成交价低于开仓价，即止损 / 情绪离场）额外再锁
+    ``COOLDOWN_DAYS`` 个自然日，抑制"清仓→再买→再清"的反复止损。亏损离场即便卖单被
+    拒/撤单也先登记，其余离场由成交回报登记；盘前刷新时清掉已过期的记录，避免持久化
+    数据无限增长。
 
     布林上轨止盈（兜底）：每日盘前按**当天可卖出的持仓**批量取**前复权**日线，算当日
     日线布林上轨（MA + boll_dev × σ，σ 用总体标准差，与 ``ArrayManager.boll`` 同口径）
@@ -117,9 +122,11 @@ class NearMaSurgeStrategy(StrategyTemplate):
     TIER_BREAKEVEN_PCT: float = 0.03
     TIER_BREAKEVEN_FLOOR: float = 0.0
 
-    # 亏损离场（止损 / 情绪离场）后记录**止损日**，止损日起 COOLDOWN_DAYS 个自然日内
-    # 不再买入该标的（含止损当日：D 日止损 → D、D+1、D+2 三天不买，D+3 起释放）。
-    # 用自然日近似交易日，规避交易日历依赖；改本值对已有记录立即生效
+    # 离场冷却：任何离场（含止盈）当天起不再买入该标的（当天一律禁买）；**亏损离场**
+    # （成交价低于开仓价）在此基础上额外再锁 COOLDOWN_DAYS 个自然日
+    # （D 日亏损离场 → D、D+1、D+2 三天不买，D+3 起释放），抑制"清仓→再买→再清"。
+    # 用自然日近似交易日，规避交易日历依赖；记录里存的是禁入截止日，
+    # 改本值只对之后新登记的记录生效
     COOLDOWN_DAYS: int = 2
 
     # 分档止盈参数（可配置）：收益达 half_profit_pct 仓位减半，达 clear_profit_pct 清仓
@@ -192,7 +199,9 @@ class NearMaSurgeStrategy(StrategyTemplate):
             self, timeout=self.SELL_ORDER_TIMEOUT, label="卖出"
         )
 
-        # 亏损离场后的买入冷却：vt_symbol -> 止损离场日（YYYYMMDD，持久化，重启不丢）
+        # 买入禁入：vt_symbol -> 禁入截止日（YYYYMMDD，持久化，重启不丢）。当天有卖出
+        # 成交（止损 / 情绪离场 / 止盈 / 减半）即写入——至少锁离场当天；亏损离场（成交价
+        # 低于开仓价）额外再锁 COOLDOWN_DAYS 个自然日（见 _record_cooldown / is_buy_cooldown）
         self.cooldown_dates: dict[str, str] = {}
 
         # 持仓追踪：开仓价与开仓后最大收益率，用于移动止盈。
@@ -321,7 +330,7 @@ class NearMaSurgeStrategy(StrategyTemplate):
                 self._sync_tracking_state()
 
     def _sync_tracking_state(self) -> None:
-        """持久化策略变量（开仓价 / 最大收益 / 止损冷却日）到 portfolio_strategy_data.json"""
+        """持久化策略变量（开仓价 / 最大收益 / 离场冷却日）到 portfolio_strategy_data.json"""
         self.sync_data()
 
     def _init_max_profit_from_tick(self, vt_symbol: str, tick: TickData) -> None:
@@ -392,10 +401,13 @@ class NearMaSurgeStrategy(StrategyTemplate):
                     msg: str = self._fmt_sell_msg(vt_symbol, tick, result)
                     self.write_log(msg)
                     self.send_wecom(msg)
-                    # 亏损离场（止损 / 情绪离场）后给该标的加买入冷却，避免"清仓→再买→
-                    # 再清"反复止损；止盈离场不加冷却，允许新一轮拉升再进
+                    # 亏损离场（止损 / 情绪离场）即便卖单被拒/撤单也先登记禁入截止日、
+                    # 立即落盘，额外锁 COOLDOWN_DAYS 天；其余离场（含止盈）由成交回报
+                    # 登记，只锁离场当天
                     if result.type == SignalType.CLEAR and self._profit_pct(vt_symbol, tick) < 0:
-                        end: str = self._set_cooldown(vt_symbol, tick)
+                        end: str = self._set_cooldown(
+                            vt_symbol, tick.datetime, self.COOLDOWN_DAYS
+                        )
                         self.write_log(
                             f"{vt_symbol} 亏损离场，买入冷却至 {end}（含）"
                         )
@@ -443,37 +455,47 @@ class NearMaSurgeStrategy(StrategyTemplate):
             return 0.0
         return (tick.last_price - entry_price) / entry_price
 
-    def _cooldown_end(self, stop_date: str) -> str:
-        """冷却窗口最后一天（止损日 + COOLDOWN_DAYS 天，YYYYMMDD）；日期非法返回空串。"""
-        try:
-            stop: datetime = datetime.strptime(stop_date, "%Y%m%d")
-        except ValueError:
-            return ""
-        return (stop + timedelta(days=self.COOLDOWN_DAYS)).strftime("%Y%m%d")
-
     def is_buy_cooldown(self, vt_symbol: str, today: str) -> bool:
-        """该标的今天是否仍在亏损离场冷却期内（含止损当日与窗口最后一天）。
+        """该标的今天是否处于买入禁入期（离场当天一律禁买 + 亏损离场的额外冷却）。
 
-        ``today`` 为 YYYYMMDD；固定宽度下字符串比较即时间先后，只需对止损日做一次
-        日期运算，供每 tick 买入前置低开销调用。
+        ``cooldown_dates`` 存的是**禁入截止日**（YYYYMMDD），固定宽度下字符串比较即
+        时间先后，供每 tick 买入前置低开销调用；记录由任何卖出成交登记
+        （见 ``_record_cooldown``），因此天然覆盖"当天卖出后当天不再买回"。
         """
-        stop_date: str = self.cooldown_dates.get(vt_symbol, "")
-        if not stop_date:
+        return today <= self.cooldown_dates.get(vt_symbol, "")
+
+    def _is_loss_exit(self, vt_symbol: str, price: float) -> bool:
+        """卖出成交是否亏损离场（成交价低于开仓价）。
+
+        用**成交价**而非信号触发时的现价比较：止损 / 情绪离场的判定发生在信号层，
+        成交价才是已实现的离场价。开仓价缺失（重启且 JSON 丢失）时按不亏损处理，
+        只锁离场当天。
+        """
+        entry_price: float = self.entry_prices.get(vt_symbol, 0.0)
+        return entry_price > 0 and price < entry_price
+
+    def _record_cooldown(self, vt_symbol: str, when: datetime, days: int) -> bool:
+        """登记该标的的买入禁入截止日（YYYYMMDD），返回是否发生变化。
+
+        ``days`` 为该次离场额外锁定的自然日数：``0`` = 只锁离场当天（任何离场都至少
+        如此），``COOLDOWN_DAYS`` = 亏损离场的额外冷却。同一笔离场可能登记两次
+        （亏损离场在卖单发出时先记、成交回报时再记），因此只在**新截止日更晚**时才更新，
+        绝不把窗口改短。
+        """
+        end: str = (when + timedelta(days=days)).strftime("%Y%m%d")
+        if end <= self.cooldown_dates.get(vt_symbol, ""):
             return False
-        end: str = self._cooldown_end(stop_date)
-        return bool(end) and stop_date <= today <= end
+        self.cooldown_dates[vt_symbol] = end
+        return True
 
-    def _set_cooldown(self, vt_symbol: str, tick: TickData) -> str:
-        """登记亏损离场日，返回冷却窗口最后一天（YYYYMMDD）。
+    def _set_cooldown(self, vt_symbol: str, when: datetime, days: int) -> str:
+        """登记禁入截止日并立即落盘，返回截止日（YYYYMMDD）。
 
-        记录的是**止损日**本身（便于排查，且改 ``COOLDOWN_DAYS`` 对已有记录立即生效），
-        是否仍在冷却期内由 ``is_buy_cooldown`` 现算。登记后立即落盘：若卖单被拒/撤单
-        就不会有成交回调触发保存，重启会丢掉冷却记录。
+        登记后立即落盘：若卖单被拒/撤单就不会有成交回调触发保存，重启会丢掉这条冷却。
         """
-        stop_date: str = tick.datetime.strftime("%Y%m%d")
-        self.cooldown_dates[vt_symbol] = stop_date
+        self._record_cooldown(vt_symbol, when, days)
         self._sync_tracking_state()
-        return self._cooldown_end(stop_date)
+        return self.cooldown_dates[vt_symbol]
 
     def _fmt_sell_msg(self, vt_symbol: str, tick: TickData, result: SignalResult) -> str:
         """拼接卖出信号消息（日志/企微复用）"""
@@ -506,7 +528,14 @@ class NearMaSurgeStrategy(StrategyTemplate):
                 self.max_profit_pct[vt_symbol] = 0.0
                 tracking_changed = True
         else:
-            # 平仓后仓位归零则清理追踪，允许后续新一轮拉升再进
+            # 离场冷却：任何卖出成交（止损 / 情绪离场 / 止盈 / 减半）都登记禁入截止日——
+            # 至少锁"离场当天不再买入"；亏损离场（成交价低于开仓价）额外锁 COOLDOWN_DAYS 天。
+            # 用成交价判断盈亏，此刻 entry_prices 尚未被下面的归零清理移除
+            days: int = self.COOLDOWN_DAYS if self._is_loss_exit(vt_symbol, trade.price) else 0
+            if self._record_cooldown(vt_symbol, trade.datetime, days):
+                tracking_changed = True
+
+            # 平仓后仓位归零则清理追踪；再见拉升要等禁入期过去后才能再进
             if self.get_pos(vt_symbol) <= 0:
                 if vt_symbol in self.entry_prices or vt_symbol in self.max_profit_pct:
                     self.entry_prices.pop(vt_symbol, None)
@@ -591,11 +620,11 @@ class NearMaSurgeStrategy(StrategyTemplate):
 
         # 标记今日已尝试刷新（用日历当天，供 on_tick 日切检测），避免每 tick 重复查库
         self.last_refresh_date = today
-        # 清理已出冷却窗口的记录，避免持久化数据无限增长
+        # 清理已过禁入期的记录（截止日早于今天），避免持久化数据无限增长
         self.cooldown_dates = {
-            symbol: stop_date
-            for symbol, stop_date in self.cooldown_dates.items()
-            if self._cooldown_end(stop_date) >= today
+            symbol: end
+            for symbol, end in self.cooldown_dates.items()
+            if end >= today
         }
         if not rows:
             self.write_log(
