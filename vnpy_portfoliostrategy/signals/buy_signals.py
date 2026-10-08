@@ -319,17 +319,23 @@ class CashGateSubSignal(SubSignal):
     ``on_tick`` 见 ``prev`` 为 BUY 才校验本策略总占用资金（``context.deployed_cash`` =
     持仓成本 + 在途买单）加上本笔买入金额是否超过 ``max_cash``：
 
-    - 超限 → 否定为 NONE（不发买单），计数 + 写日志 + 推企微提示，并标记 ``entered``
-      防止后续 tick 重复告警；
+    - 超限 → 否定为 NONE（不发买单），计数 + 写日志 + 推企微提示（**同一标的当日只
+      告警一次**，按 ``_alert_date`` 去重）；
     - 未超限 → 原样放行 ``prev`` 的 BUY（不补 reason，资金是总量闸门而非准入条件）。
+
+    **不写 ``entered``**：资金不足 ≠ 已买入，不能因此认为该标的建仓完成。否则一旦
+    后续资金释放（卖出回款 / 容量回收），该标的当天再也买不进。重复触发由 ``_alert_date``
+    按日去重兜底：只是不再推送消息，每 tick 仍会重新校验资金，够钱就立即放行。
 
     ``prev`` 非 BUY 时直接返回 NONE（短路，不查资金）。
     """
 
     def __init__(self, vt_symbol: str, strategy: StrategyTemplate) -> None:
-        """构造函数：初始化本次判定结果。"""
+        """构造函数：初始化本次判定结果与当日告警去重标记。"""
         super().__init__(vt_symbol, strategy)
         self._result: SignalResult = SignalResult()
+        # 最近一次资金不足告警的日期（YYYYMMDD）：同一标的当日只告警一次
+        self._alert_date: str = ""
 
     def on_tick(self, tick: TickData, prev: SignalResult) -> SignalResult:
         """前序有 BUY 意向才校验资金上限；超限则否定+告警，否则放行。"""
@@ -343,17 +349,21 @@ class CashGateSubSignal(SubSignal):
         needed: float = prev.price * prev.volume
 
         if deployed + needed > s.max_cash:
-            self._alert_cash_short(prev)
-            s.entered.add(self.vt_symbol)
-            s.put_event()
+            # 只告警不建仓：资金不足不算已买入，不写 entered，资金释放后同一标的仍可买入
+            self._alert_cash_short(tick, prev)
             self._result = SignalResult()
             return self._result
 
         self._result = prev
         return self._result
 
-    def _alert_cash_short(self, prev: SignalResult) -> None:
-        """资金不足告警：计数 + 写日志 + 推企微（每次跳过都是去重的独立事件）。"""
+    def _alert_cash_short(self, tick: TickData, prev: SignalResult) -> None:
+        """资金不足告警：同一标的当日只告警一次（计数 + 写日志 + 推企微）。"""
+        today: str = tick.datetime.strftime("%Y%m%d")
+        if self._alert_date == today:
+            return
+        self._alert_date = today
+
         s = self.strategy
         s.cash_short_count += 1
         name: str = s._get_symbol_name(self.vt_symbol)

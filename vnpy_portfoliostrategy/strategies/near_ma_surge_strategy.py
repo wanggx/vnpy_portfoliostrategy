@@ -57,7 +57,8 @@ class NearMaSurgeStrategy(StrategyTemplate):
     资金约束：本策略**总占用资金**（持仓成本 + 在途买单）不超过 ``max_cash`` 元上限，
     单笔买入仍是 ``fixed_size`` 股，不按单笔金额限制。资金校验由买入链尾的
     ``CashGateSubSignal`` 完成（刷新 ``context.deployed_cash`` = 持仓成本 + 在途买单，
-    超上限则否定买入并推企微提示）；跳过即标记 entered，同一标的当日不会重复触发，不刷屏。
+    超上限则否定买入并推企微提示）。资金不足**不写 ``entered``**（不足 ≠ 已买入，后续
+    资金释放后仍可买入），同一标的当日只告警一次防刷屏，每 tick 仍重新校验资金。
 
     信号架构分两层：买入/卖出各一个总信号（``BuyAggregator`` / ``SellAggregator``），
     内部按 ``vt_symbol`` 维护子信号映射并分发行情；子信号经 ``signal_result()`` 返回
