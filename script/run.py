@@ -9,6 +9,7 @@ _VNPY_XT_ROOT = os.path.abspath(
 if os.path.isdir(_VNPY_XT_ROOT) and _VNPY_XT_ROOT not in sys.path:
     sys.path.insert(0, _VNPY_XT_ROOT)
 
+from bigqmt_signal_trader.xtquant_compat import get_default_client
 from vnpy.event import EventEngine
 from vnpy.trader.engine import MainEngine
 from vnpy.trader.ui import MainWindow, create_qapp
@@ -21,6 +22,14 @@ from vnpy_portfoliostrategy import PortfolioStrategyApp
 
 def main() -> None:
     """Start Trader"""
+    client = get_default_client()
+    if client.transport_name != "pipe":
+        raise RuntimeError(
+            "vnpy_portfoliostrategy requires BigQMT transport=pipe; "
+            f"configured transport is {client.transport_name!r}"
+        )
+    print(f"BigQMT transport=pipe account={client.account_id}")
+
     qapp = create_qapp()
 
     event_engine = EventEngine()
