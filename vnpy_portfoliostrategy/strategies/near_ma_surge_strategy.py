@@ -103,6 +103,9 @@ class NearMaSurgeStrategy(StrategyTemplate):
 
     # 每日盘前刷新订阅标的池的固定时刻（09:15）
     REFRESH_TIME: time = time(9, 15)
+    # 刷新查空后的重试间隔（秒）：只在拿到当日池后才记 last_refresh_date，
+    # 查空/异常时按此间隔重试，避免数据晚到就整天用不上的同时不刷库
+    REFRESH_RETRY_SEC: float = 60.0
     # 连续竞价开始时刻（09:30）；此前为集合竞价，波动大，不做买卖判定
     MARKET_OPEN_TIME: time = time(9, 30)
 
@@ -179,8 +182,11 @@ class NearMaSurgeStrategy(StrategyTemplate):
         self.target_symbols: dict[str, str] = {}
         # 当日标的池全行数据：vt_symbol -> row(dict)，保留库表所有列
         self.universe_data: dict[str, dict] = {}
-        # 最近一次刷新日期（YYYYMMDD），用于日切判断
+        # 最近一次**成功**刷新日期（YYYYMMDD），用于日切判断；查空/异常时不写，
+        # 由 last_refresh_attempt 节流重试
         self.last_refresh_date: str = ""
+        # 最近一次刷新**尝试**时间（仅内存，不持久化）：查空后按 REFRESH_RETRY_SEC 重试
+        self.last_refresh_attempt: datetime | None = None
         # 累计触发拉升买入次数
         self.surge_count: int = 0
 
@@ -191,6 +197,9 @@ class NearMaSurgeStrategy(StrategyTemplate):
 
         # 资金约束运行时状态（仅内存，不落盘）：当日因可用资金不足跳过的买入次数
         self.cash_short_count: int = 0
+        # 资金不足企微推送的全局节流时间戳（秒）：同日多个标的先后资金不足时，
+        # 60 秒内只推一条，避免整屏刷屏（日志不受影响）
+        self.cash_short_last_alert_ts: float = 0.0
 
         # 卖出委托监控（通用件，仅运行时状态，不持久化）：全部成交/撤单/拒单即摘除，
         # 超时未全部成交则告警并撤单（不重发）。label="卖出" 让告警文案为
@@ -232,22 +241,22 @@ class NearMaSurgeStrategy(StrategyTemplate):
         self.buy_signal: BuyAggregator = BuyAggregator(self)
         # 卖出总信号：按 vt_symbol 聚合卖出子信号，情绪卖出优先，其次价格卖出
         self.sell_signal: SellAggregator = SellAggregator(self)
-        t = datetime.now()
-        self.load_bars(1)
-        self.write_log(f"load_bars 耗时 {(datetime.now() - t).total_seconds():.2f}s")
 
     def on_start(self) -> None:
         """策略启动回调"""
         self.write_log("策略启动")
+        # 标的池为空时用订阅集合兜底：否则买入判定会在 target_symbols 检查处静默短路，
+        # 整个交易日不产生任何信号（手工清过持久化数据、或前一交易日无数据时会这样）
+        self._fallback_pool_from_subscriptions()
 
     def _restore_subscribed_symbols(self) -> None:
         """还原订阅集合并补订行情
 
-        ``on_init`` 时引擎尚未把 data JSON 写回实例，因此同时读取内存字段和
-        ``strategy_data``。``vt_symbols`` 已由 setting 载入。
+        ``on_init`` 阶段引擎尚未把 variables 回填到实例（见 ``_init_strategy``：
+        回填发生在 ``on_init`` 返回之后），此时 ``self.target_symbols`` 必然为空，
+        因此只能读 ``strategy_engine.strategy_data`` 里上一次落盘的标的池。
         """
         restored: set[str] = set(self.vt_symbols)
-        restored.update(self.target_symbols.keys())
         restored.update(
             vt_symbol for vt_symbol, position in self.pos_data.items()
             if position != 0
@@ -283,6 +292,30 @@ class NearMaSurgeStrategy(StrategyTemplate):
         self.subscribed_symbols = restored
         if restored:
             self.write_log(f"订阅集合已还原：{len(restored)} 只")
+
+    def _fallback_pool_from_subscriptions(self) -> None:
+        """标的池为空时回退到当前订阅集合
+
+        ``target_symbols`` 只由 ``refresh_universe`` 写入；前一交易日查不到数据、
+        或手工清过 ``portfolio_strategy_data.json`` 时它是空的，买入判定会在
+        ``target_symbols`` 检查处静默短路，整个交易日不产生任何信号。此时按已订阅
+        标的兜底，让策略继续在自己订阅过的标的上判定；池非空时不做任何改动，
+        后续每日刷新拿到数据后仍按原逻辑整体替换。
+        """
+        if self.target_symbols:
+            return
+
+        targets: dict[str, str] = {
+            vt_symbol: self._get_symbol_name(vt_symbol)
+            for vt_symbol in self.subscribed_symbols
+            if vt_symbol
+        }
+        if not targets:
+            self.write_log("标的池为空且无已订阅标的，本次不会产生买入信号")
+            return
+
+        self.target_symbols = targets
+        self.write_log(f"标的池为空，回退到现有订阅标的 {len(targets)} 只")
 
     def _get_symbol_name(self, vt_symbol: str) -> str:
         """取标的名称：直接查 MainEngine 的合约缓存。
@@ -349,6 +382,13 @@ class NearMaSurgeStrategy(StrategyTemplate):
         self.max_profit_pct[vt_symbol] = profit_pct
         self._sync_tracking_state()
 
+    def _refresh_allowed(self) -> bool:
+        """刷新节流：查空/异常后按 ``REFRESH_RETRY_SEC`` 重试一次，避免每 tick 打数据库"""
+        if self.last_refresh_attempt is None:
+            return True
+        elapsed: float = (datetime.now() - self.last_refresh_attempt).total_seconds()
+        return elapsed >= self.REFRESH_RETRY_SEC
+
     def _is_trading_session(self, tick: TickData) -> bool:
         """是否处于连续竞价时段（09:30 起）
 
@@ -367,11 +407,21 @@ class NearMaSurgeStrategy(StrategyTemplate):
         #    才是"今天的可卖量"；boll_date 是内存标记，盘中重启当天也会补算一次
         tick_date: str = tick.datetime.strftime("%Y%m%d")
         tick_time = tick.datetime.time()
-        if tick_date != self.last_refresh_date and tick_time >= self.REFRESH_TIME:
+        if (
+            tick_date != self.last_refresh_date
+            and tick_time >= self.REFRESH_TIME
+            and self._refresh_allowed()
+        ):
             self.refresh_universe()
         if tick_date != self.boll_date and tick_time >= self.REFRESH_TIME:
             self.boll_date = tick_date
             self._refresh_boll_bands()
+
+        # 未启动（仅初始化 / 已停止）时不做买卖判定：send_order 在 trading=False 时
+        # 直接返回空列表，若继续判定仍会写 entered / entry_prices 并推送"已买入"消息，
+        # 实际一张委托都没有，且当天再也不会买这只票
+        if not self.trading:
+            return
 
         # 集合竞价时段仅刷新标的池，不做买卖判定与窗口采样
         if not self._is_trading_session(tick):
@@ -561,11 +611,9 @@ class NearMaSurgeStrategy(StrategyTemplate):
         # 委托终结（全部成交/撤单/拒单）即去掉卖出委托监控
         self.sell_monitor.update_order(order)
 
-        # 只推终态；部分成交(PARTTRADED)由 update_trade 的成交通知逐笔覆盖，
-        # 不再重复推委托通知，避免分多笔成交的委托刷屏
-        if order.status not in {
-            Status.ALLTRADED, Status.CANCELLED, Status.REJECTED
-        }:
+        # 只推撤单/拒单：全部成交由 update_trade 的成交通知逐笔覆盖，
+        # 再推一条"委托全部成交"只是重复消息
+        if order.status not in {Status.CANCELLED, Status.REJECTED}:
             return
 
         name: str = self._get_symbol_name(order.vt_symbol)
@@ -582,11 +630,17 @@ class NearMaSurgeStrategy(StrategyTemplate):
 
         DB 数据按前一交易日生成（screening 基于前一交易日收盘价），因此取数日期
         取前一交易日（由大 QMT 交易日历给出，自动跨越周末/节假日）。
-        若前一交易日查不到数据，不做任何订阅/退订处理，维持昨天的订阅数据（现有订阅保持不变）。
+        若前一交易日查不到数据，不做任何订阅/退订处理，维持昨天的订阅数据（现有订阅保持不变）；
+        此时若标的池为空（手工清过持久化数据 / 首次初始化），回退为当前订阅集合，
+        避免空池让买入判定全天静默短路。
         """
         sql_engine = self._get_sql_engine()
         if sql_engine is None:
             return
+
+        # 记录本次尝试时间：查空/异常时不写 last_refresh_date，on_tick 会按
+        # REFRESH_RETRY_SEC 节流重试（09:15 后数据才落地的场景）
+        self.last_refresh_attempt = datetime.now()
 
         # 取数日期：DB 数据按前一交易日生成，直接查前一交易日的行
         today: str = datetime.now().strftime("%Y%m%d")
@@ -618,8 +672,6 @@ class NearMaSurgeStrategy(StrategyTemplate):
             )
             return
 
-        # 标记今日已尝试刷新（用日历当天，供 on_tick 日切检测），避免每 tick 重复查库
-        self.last_refresh_date = today
         # 清理已过禁入期的记录（截止日早于今天），避免持久化数据无限增长
         self.cooldown_dates = {
             symbol: end
@@ -629,7 +681,10 @@ class NearMaSurgeStrategy(StrategyTemplate):
         if not rows:
             self.write_log(
                 f"前一交易日(trade_date={trade_date})行业“{self.industry_name}”无数据，维持现有订阅"
+                f"（{self.REFRESH_RETRY_SEC:.0f}s 后重试）"
             )
+            # 池为空时回退到订阅集合，避免空池让全天买入判定静默短路
+            self._fallback_pool_from_subscriptions()
             self.strategy_engine.sync_strategy_data(self)
             self.put_event()
             return
@@ -686,6 +741,9 @@ class NearMaSurgeStrategy(StrategyTemplate):
 
         # 动态标的池变化后重新读取经纪商持仓，确保每个标的独立完成 T+1 同步。
         self.strategy_engine.init_t1_position(self)
+
+        # 只有成功拿到当日池才标记今天已刷新：查空/异常路径不写，留待节流重试
+        self.last_refresh_date = today
 
         self.write_log(
             f"标的池刷新完成：trade_date={trade_date} 行业“{self.industry_name}” "

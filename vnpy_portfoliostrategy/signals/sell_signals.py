@@ -35,7 +35,7 @@
 from __future__ import annotations
 
 import math
-from datetime import time
+from datetime import datetime, time
 from typing import TYPE_CHECKING
 
 from vnpy.trader.object import BarData, TickData
@@ -382,11 +382,18 @@ class PriorityCompositeSubSignal(SubSignal):
     # 子类覆盖：按优先级排列的子信号工厂列表
     sub_factories: list = []
 
+    # 最大收益创新高的落盘节流窗口（秒）：新高几乎每个 tick 都会刷新，逐次全量
+    # 写 portfolio_strategy_data.json 会在主线程产生高频磁盘 IO；停止策略时引擎
+    # 还会整体落盘一次，因此中间值可以丢
+    MAX_PROFIT_SYNC_SEC: float = 30.0
+
     def __init__(self, vt_symbol: str, strategy: StrategyTemplate) -> None:
         """构造函数：按 sub_factories 创建子信号实例并初始化结果缓存。"""
         super().__init__(vt_symbol, strategy)
         self._subs: list[SubSignal] = [f(vt_symbol, strategy) for f in self.sub_factories]
         self._result: SignalResult = SignalResult()
+        # 上次落盘时间戳（秒）：节流用
+        self._last_sync_ts: float = 0.0
 
     def on_tick(self, tick: TickData, prev: SignalResult) -> SignalResult:
         """公共前置更新最大收益后，按序短路运行子信号，取首个非 NONE 结果。"""
@@ -401,7 +408,7 @@ class PriorityCompositeSubSignal(SubSignal):
         return result
 
     def _update_max_profit(self, tick: TickData) -> None:
-        """公共前置：更新历史最大收益率（写策略 max_profit_pct + 持久化）。"""
+        """公共前置：更新历史最大收益率（写策略 max_profit_pct，按窗口节流落盘）。"""
         s = self.strategy
         entry_price: float | None = s.entry_prices.get(self.vt_symbol, None)
         if not entry_price or entry_price <= 0 or not tick.last_price:
@@ -410,7 +417,10 @@ class PriorityCompositeSubSignal(SubSignal):
         max_profit: float = s.max_profit_pct.get(self.vt_symbol, 0.0)
         if profit_pct > max_profit:
             s.max_profit_pct[self.vt_symbol] = profit_pct
-            s._sync_tracking_state()
+            now_ts: float = datetime.now().timestamp()
+            if now_ts - self._last_sync_ts >= self.MAX_PROFIT_SYNC_SEC:
+                self._last_sync_ts = now_ts
+                s._sync_tracking_state()
 
     def on_bar(self, bar: BarData, prev: SignalResult) -> SignalResult:
         """K线推送回调：本信号走 tick，此处不处理，原样返回 prev。"""

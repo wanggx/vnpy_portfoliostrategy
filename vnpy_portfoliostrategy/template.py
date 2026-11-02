@@ -557,6 +557,12 @@ class StrategyTemplate(ABC):
             self.strategy_engine.send_wecom(msg, self)
 
     def sync_data(self) -> None:
-        """同步策略状态数据到文件"""
-        if self.trading:
+        """同步策略状态数据到文件
+
+        初始化完成后即允许落盘（不再要求 ``trading``）：初始化阶段写入的开仓价 /
+        最大收益 / 冷却日同样需要持久化，只在 ``trading`` 时写会在"初始化但未启动"
+        的窗口里静默丢状态。``on_init`` 阶段 ``inited`` 仍为 False，因此不会覆盖
+        待恢复的历史数据（引擎在 ``on_init`` 返回后才回填 variables）。
+        """
+        if self.inited:
             self.strategy_engine.sync_strategy_data(self)

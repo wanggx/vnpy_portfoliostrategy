@@ -11,7 +11,8 @@
    不写 ``entered``，大盘当天转好后标的再起拉升仍可买入）。其余大盘评级下按档看行业：
    大盘评级中性以上（快照可用）时行业需中性及以上，大盘评级中性（含大盘快照不可用）时
    行业需中性以上（不含中性）。达标则保留 BUY 并把大盘 / 行业评级补进 reason；行业不达标
-   则记拦截日志 / 企微 + ``entered.add``，否定为 NONE（短路后续子信号）。
+   则按日去重记拦截日志 / 企微后否定为 NONE（短路后续子信号），**不写 ``entered``**——
+   行业评级盘中转好后该标的仍可买入。
 
 需要持久化的全局状态（``entered`` 去重集合、``cooldown_dates`` 离场冷却、标的池）经
 ``self.strategy`` 访问；子信号只持有价格窗口、行业判定器实例等运行时状态。
@@ -213,7 +214,7 @@ class SectorBuySubSignal(SubSignal):
       转好后该标的再起拉升仍可买入。
     - 大盘其余评级：大盘评级中性以上（快照可用）时行业需中性及以上、大盘评级中性（含大盘
       快照不可用）时行业需中性以上，达标则保留 BUY 并把大盘 / 行业评级补进 reason；行业不
-      达标则记拦截日志 / 企微 + ``entered.add``，否定为 NONE（短路后续子信号）。
+      达标则按日去重记拦截日志 / 企微后否定为 NONE（短路后续子信号），**不写 ``entered``**。
 
     ``prev`` 非 BUY 时直接返回 NONE（不查情绪，避免每 tick 刷屏）。复用 ``SectorBuySignal``
     做大盘 + 行业评级判定。
@@ -227,6 +228,8 @@ class SectorBuySubSignal(SubSignal):
         # 大盘拦截消息已推送的日期（YYYYMMDD）：大盘拦截可能持续整日、每 tick 都命中，
         # 按日去重避免同一标的反复刷日志 / 企微
         self._market_block_date: str = ""
+        # 行业拦截消息已推送的日期（YYYYMMDD）：同上，只去重消息，不写 entered
+        self._sector_block_date: str = ""
 
     def on_tick(self, tick: TickData, prev: SignalResult) -> SignalResult:
         """前序有 BUY 意向才查大盘+行业；大盘/行业不可买则拦截+否定，可买则保留并补评级。"""
@@ -244,26 +247,10 @@ class SectorBuySubSignal(SubSignal):
             self._result = SignalResult()
             return self._result
 
-        # 行业拦截：记日志/企微 + 标记本轮已处理，否定买入
+        # 行业拦截：按日去重记日志/企微后否定买入；**不写 entered**——行业评级盘中
+        # 转好后该标的再起拉升仍应能买入，写 entered 会让它当天彻底失去机会
         if not sector_result.buyable:
-            name: str = s._get_symbol_name(self.vt_symbol)
-            buy_price: float = tick.last_price + s.price_add
-            context: str = format_sentiment_context(
-                sector_result.market_level,
-                sector_result.market_score,
-                sector_result.sector_name,
-                sector_result.sector_level,
-                sector_result.sector_score,
-            )
-            skip_msg: str = (
-                f"行业情绪拦截 {self.vt_symbol}({name}) "
-                f"买入价格 {buy_price:.2f} {context}，未达准入，不买入"
-            )
-            s.write_log(skip_msg)
-            s.send_wecom(skip_msg)
-            # 标记本轮已处理，避免同一波拉升反复拦截刷屏
-            s.entered.add(self.vt_symbol)
-            s.put_event()
+            self._log_sector_block(tick, sector_result)
             self._result = SignalResult()
             return self._result
 
@@ -303,6 +290,35 @@ class SectorBuySubSignal(SubSignal):
         s.write_log(skip_msg)
         s.send_wecom(skip_msg)
 
+    def _log_sector_block(self, tick: TickData, sector_result: SectorBuyResult) -> None:
+        """行业未达标拦截：按日去重记一次日志 + 企微（同一标的当日只推一条）
+
+        与大盘拦截一致，只去重消息，**不动 ``entered``**：行业评级盘中转好后，
+        该标的再起拉升仍应能买入。
+        """
+        today: str = tick.datetime.strftime("%Y%m%d")
+        if self._sector_block_date == today:
+            return
+        self._sector_block_date = today
+
+        s = self.strategy
+        name: str = s._get_symbol_name(self.vt_symbol)
+        buy_price: float = tick.last_price + s.price_add
+        context: str = format_sentiment_context(
+            sector_result.market_level,
+            sector_result.market_score,
+            sector_result.sector_name,
+            sector_result.sector_level,
+            sector_result.sector_score,
+        )
+        skip_msg: str = (
+            f"行业情绪拦截 {self.vt_symbol}({name}) "
+            f"买入价格 {buy_price:.2f} {context}，未达准入，不买入"
+        )
+        s.write_log(skip_msg)
+        s.send_wecom(skip_msg)
+        s.put_event()
+
     def on_bar(self, bar: BarData, prev: SignalResult) -> SignalResult:
         """K线推送回调：本信号走 tick，此处不处理，原样返回 prev。"""
         self._result = prev
@@ -320,7 +336,7 @@ class CashGateSubSignal(SubSignal):
     持仓成本 + 在途买单）加上本笔买入金额是否超过 ``max_cash``：
 
     - 超限 → 否定为 NONE（不发买单），计数 + 写日志 + 推企微提示（**同一标的当日只
-      告警一次**，按 ``_alert_date`` 去重）；
+      告警一次**，按 ``_alert_date`` 去重；企微另有跨标的 60 秒全局节流，日志不受限）；
     - 未超限 → 原样放行 ``prev`` 的 BUY（不补 reason，资金是总量闸门而非准入条件）。
 
     **不写 ``entered``**：资金不足 ≠ 已买入，不能因此认为该标的建仓完成。否则一旦
@@ -336,6 +352,9 @@ class CashGateSubSignal(SubSignal):
         self._result: SignalResult = SignalResult()
         # 最近一次资金不足告警的日期（YYYYMMDD）：同一标的当日只告警一次
         self._alert_date: str = ""
+
+    # 资金不足告警的企微推送间隔（秒）：跨标的全局节流，日志不受影响
+    CASH_SHORT_ALERT_SEC: float = 60.0
 
     def on_tick(self, tick: TickData, prev: SignalResult) -> SignalResult:
         """前序有 BUY 意向才校验资金上限；超限则否定+告警，否则放行。"""
@@ -358,7 +377,11 @@ class CashGateSubSignal(SubSignal):
         return self._result
 
     def _alert_cash_short(self, tick: TickData, prev: SignalResult) -> None:
-        """资金不足告警：同一标的当日只告警一次（计数 + 写日志 + 推企微）。"""
+        """资金不足告警：同一标的当日只告警一次（计数 + 写日志 + 推企微）
+
+        日志逐笔写（每标的当日一条），企微再加一层全局节流：同日多个标的先后资金不足
+        时 60 秒内只推一条，消息里的"当日已跳过 N 笔"给出累计数，避免整屏刷屏。
+        """
         today: str = tick.datetime.strftime("%Y%m%d")
         if self._alert_date == today:
             return
@@ -373,7 +396,11 @@ class CashGateSubSignal(SubSignal):
             f"策略资金上限 {s.max_cash:.0f}（当日已跳过 {s.cash_short_count} 笔）"
         )
         s.write_log(msg)
-        s.send_wecom(msg)
+
+        now_ts: float = tick.datetime.timestamp()
+        if now_ts - s.cash_short_last_alert_ts >= self.CASH_SHORT_ALERT_SEC:
+            s.cash_short_last_alert_ts = now_ts
+            s.send_wecom(msg)
 
     def on_bar(self, bar: BarData, prev: SignalResult) -> SignalResult:
         """K线推送回调：本信号走 tick，此处不处理，原样返回 prev。"""
