@@ -28,7 +28,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vnpy.trader.constant import Exchange
 from vnpy.trader.object import BarData, TickData
@@ -134,12 +134,17 @@ class SentimentSignal:
     日志统一走策略引擎的 ``write_log``（带策略名前缀，进主窗口日志栏）。
     """
 
-    def __init__(self, strategy: StrategyTemplate) -> None:
+    def __init__(self, strategy: StrategyTemplate, sentiment_context: Any = None) -> None:
         """构造函数
 
         传入所属策略 ``strategy``，从中取 ``strategy_engine``（用于写日志）与
         ``main_engine``（用于取情绪引擎）。日志经 ``strategy_engine.write_log``
         输出，自动带上策略名前缀。
+
+        阶段四：``sentiment_context`` 为可选注入的统一情绪上下文（实盘
+        ``LiveSentimentContext`` / 回测 ``ReplaySentimentContext``）。为 None 时
+        按查找顺序解析（显式 context → strategy.context.sentiment →
+        strategy_engine.sentiment_context → MainEngine 实时引擎 → 降级）。
         """
         self.strategy: StrategyTemplate | None = strategy
         self.strategy_engine = (
@@ -154,6 +159,8 @@ class SentimentSignal:
         # 最近行情缓存，由 on_tick / on_bar 更新，供子类按需取用
         self.last_tick: TickData | None = None
         self.last_bar: BarData | None = None
+        # 阶段四：可选注入的统一情绪上下文
+        self._sentiment_context: Any = sentiment_context
 
     def on_tick(self, tick: TickData) -> None:
         """行情推送回调：缓存最近 tick。子类可按需重载做更多处理。"""
@@ -187,6 +194,58 @@ class SentimentSignal:
             return None
         return engine
 
+    def _get_context(self) -> Any:
+        """阶段四：按查找顺序解析统一情绪上下文。
+
+        顺序：显式注入的 sentiment_context → strategy.context.sentiment →
+        strategy_engine.sentiment_context → MainEngine 实时引擎（包成
+        LiveSentimentContext）→ None。回测时前两者/三者会是 ReplaySentimentContext；
+        实盘无注入时落到 LiveSentimentContext。
+        """
+        # 1. 显式注入
+        if self._sentiment_context is not None:
+            return self._sentiment_context
+        # 2. strategy.context.sentiment
+        strategy = self.strategy
+        if strategy is not None and getattr(strategy, "context", None) is not None:
+            ctx = getattr(strategy.context, "sentiment", None)
+            if ctx is not None:
+                return ctx
+        # 3. strategy_engine.sentiment_context
+        if self.strategy_engine is not None:
+            ctx = getattr(self.strategy_engine, "sentiment_context", None)
+            if ctx is not None:
+                return ctx
+        # 4. MainEngine 实时引擎 → LiveSentimentContext
+        engine = self._resolve_engine()
+        if engine is not None:
+            try:
+                from ..context.sentiment import LiveSentimentContext
+                return LiveSentimentContext(engine)
+            except Exception:  # noqa: BLE001
+                return None
+        return None
+
+    def _get_snapshot(self) -> MarketSentimentSnapshot | None:
+        """统一取大盘情绪快照（实盘/回测共用，收敛所有 get_latest 调用）。"""
+        ctx = self._get_context()
+        if ctx is None:
+            return None
+        try:
+            return ctx.get_latest()
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _get_stock_sector(self, qmt_symbol: str) -> SectorState | None:
+        """统一取标的行业情绪（实盘/回测共用）。"""
+        ctx = self._get_context()
+        if ctx is None:
+            return None
+        try:
+            return ctx.get_stock_sector(qmt_symbol)
+        except Exception:  # noqa: BLE001
+            return None
+
     def _resolve_engine(self):
         """取市场情绪引擎（静默版）：缺失时返回 None，不写日志。
 
@@ -198,21 +257,18 @@ class SentimentSignal:
         return get_sentiment_engine(self.main_engine)
 
     def market_snapshot(self) -> MarketSentimentSnapshot | None:
-        """取大盘情绪快照（静默）；引擎未加载时返回 None。"""
-        engine = self._resolve_engine()
-        if engine is None:
-            return None
-        return engine.get_latest()
+        """取大盘情绪快照（静默）；引擎/上下文未就绪时返回 None。"""
+        return self._get_snapshot()
 
     def snapshot_available(self) -> bool:
-        """大盘情绪快照是否可信（引擎已加载、非过期、有效标的充足）。
+        """大盘情绪快照是否可信（上下文已就绪、非过期、有效标的充足）。
 
         价格档据此决定情绪档是否在岗：不可信时情绪档不触发，价格档不得放宽。
         """
-        engine = self._resolve_engine()
-        if engine is None:
+        snapshot = self._get_snapshot()
+        if snapshot is None:
             return False
-        return bool(engine.get_latest().available)
+        return bool(snapshot.available)
 
     @staticmethod
     def _vt_to_qmt(vt_symbol: str) -> str:
@@ -267,8 +323,8 @@ class SectorBuySignal(SentimentSignal):
         SentimentLevel.EXTREME_BEARISH,
     } if SentimentLevel is not None else set()
 
-    def __init__(self, strategy: StrategyTemplate) -> None:
-        super().__init__(strategy)
+    def __init__(self, strategy: StrategyTemplate, sentiment_context: Any = None) -> None:
+        super().__init__(strategy, sentiment_context)
         # 可观测变量，供策略展示/日志
         self.sector_name: str = ""
         self.sector_score: float = 0.0
@@ -302,12 +358,12 @@ class SectorBuySignal(SentimentSignal):
         """
         if vt_symbol is None:
             vt_symbol = self.vt_symbol
-        engine = self._get_engine()
-        if engine is None:
+        # 阶段四：统一经由情绪上下文取快照（实盘 LiveSentimentContext / 回测 ReplaySentimentContext）
+        snapshot: MarketSentimentSnapshot | None = self._get_snapshot()
+        if snapshot is None:
             return SectorBuyResult(False, "", 0.0, "不可用", False, "不可用", 0.0)
         # 大盘情绪快照先行：与个股行业映射无关，任何降级路径都要带上，
         # 保证拦截/放行消息里大盘评级与分数始终有值
-        snapshot: MarketSentimentSnapshot = engine.get_latest()
         self.market_level = snapshot.level.value
         self.market_score = snapshot.score
         self.market_stale = snapshot.stale
@@ -340,7 +396,7 @@ class SectorBuySignal(SentimentSignal):
             return SectorBuyResult(
                 False, "", 0.0, "", False, self.market_level, self.market_score
             )
-        state = engine.get_stock_sector(qmt_symbol)
+        state = self._get_stock_sector(qmt_symbol)
         if state is None:
             # 未分到行业或该行业有效家数不够，保守不买
             self.sector_name = ""
@@ -392,8 +448,8 @@ class SectorSellSignal(SentimentSignal):
         SentimentLevel.EXTREME_BEARISH,
     } if SentimentLevel is not None else set()
 
-    def __init__(self, strategy: StrategyTemplate) -> None:
-        super().__init__(strategy)
+    def __init__(self, strategy: StrategyTemplate, sentiment_context: Any = None) -> None:
+        super().__init__(strategy, sentiment_context)
         # 可观测变量，供策略展示/日志
         self.sector_name: str = ""
         self.sector_score: float = 0.0
@@ -426,8 +482,8 @@ class SectorSellSignal(SentimentSignal):
             self.sector_score = 0.0
             self.sector_level = ""
             return SectorSellResult(False, "", 0.0, "")
-        engine = self._get_engine()
-        if engine is None:
+        ctx = self._get_context()
+        if ctx is None:
             return SectorSellResult(False, "", 0.0, "不可用")
         qmt_symbol: str = self._vt_to_qmt(vt_symbol)
         if not qmt_symbol:
@@ -435,7 +491,7 @@ class SectorSellSignal(SentimentSignal):
             self.sector_score = 0.0
             self.sector_level = ""
             return SectorSellResult(False, "", 0.0, "")
-        state = engine.get_stock_sector(qmt_symbol)
+        state = self._get_stock_sector(qmt_symbol)
         if state is None:
             # 未分到行业或该行业有效家数不够，不触发离场
             self.sector_name = ""
@@ -462,13 +518,12 @@ class SectorSellSignal(SentimentSignal):
         """
         if vt_symbol is None:
             vt_symbol = self.vt_symbol
-        engine = self._resolve_engine()
-        if not vt_symbol or engine is None:
+        if not vt_symbol:
             return "", "不可用", 0.0
         qmt_symbol: str = self._vt_to_qmt(vt_symbol)
         if not qmt_symbol:
             return "", "不可用", 0.0
-        state = engine.get_stock_sector(qmt_symbol)
+        state = self._get_stock_sector(qmt_symbol)
         if state is None:
             return "", "未分行业", 0.0
         return state.name, state.level.value, state.score
@@ -483,13 +538,10 @@ class SectorSellSignal(SentimentSignal):
             vt_symbol = self.vt_symbol
         if not vt_symbol:
             return False
-        engine = self._resolve_engine()
-        if engine is None:
-            return False
         qmt_symbol: str = self._vt_to_qmt(vt_symbol)
         if not qmt_symbol:
             return False
-        return engine.get_stock_sector(qmt_symbol) is not None
+        return self._get_stock_sector(qmt_symbol) is not None
 
     def _evaluate(self, state: SectorState) -> bool:
         """行业情绪是否应卖出离场：评级在中性以下（偏弱 / 极弱）触发。"""
@@ -505,8 +557,8 @@ class MarketRiskOffSignal(SentimentSignal):
     # 全市场情绪分清仓阈值（0~100），仅占位，待准确逻辑替换后可能不再单一使用。
     RISKOFF_SCORE_THRESHOLD: float = 20.0
 
-    def __init__(self, strategy: StrategyTemplate) -> None:
-        super().__init__(strategy)
+    def __init__(self, strategy: StrategyTemplate, sentiment_context: Any = None) -> None:
+        super().__init__(strategy, sentiment_context)
         # 可观测变量，供策略展示/日志
         self.market_score: float = 0.0
         self.market_level: str = ""
@@ -528,11 +580,8 @@ class MarketRiskOffSignal(SentimentSignal):
 
         降级原则：引擎不可用、快照不可用或过期 → 返回 False（不触发清仓）。
         """
-        engine = self._get_engine()
-        if engine is None:
-            return False
-        snapshot: MarketSentimentSnapshot = engine.get_latest()
-        if not snapshot.available:
+        snapshot: MarketSentimentSnapshot | None = self._get_snapshot()
+        if snapshot is None or not snapshot.available:
             # 快照不可用/过期/有效标的不足，不贸然清仓
             self.market_score = snapshot.score
             self.market_level = snapshot.level.value

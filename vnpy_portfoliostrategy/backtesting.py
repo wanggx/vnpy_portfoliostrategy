@@ -9,6 +9,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from pandas import DataFrame
 from collections.abc import Callable
+from typing import Any
 
 from vnpy.trader.constant import Direction, Offset, Interval, Status
 from vnpy.trader.database import get_database, BaseDatabase
@@ -75,6 +76,10 @@ class BacktestingEngine:
 
         self.daily_results: dict[date, PortfolioDailyResult] = {}
         self.daily_df: DataFrame = None
+
+        # 阶段四：回测情绪上下文（ReplaySentimentContext），由回测入口注入。
+        # 为 None 时信号器无历史情绪，按既有保守降级。不启动 MarketSentimentEngine 后台线程。
+        self.sentiment_context: Any = None
 
     def clear_data(self) -> None:
         """清理上次回测缓存数据"""
@@ -200,6 +205,12 @@ class BacktestingEngine:
 
     def run_backtesting(self) -> None:
         """开始回测"""
+        # 阶段四：把回测情绪上下文同步到策略 context，供信号器经查找链解析。
+        # 信号器优先级：显式 context → strategy.context.sentiment → strategy_engine.sentiment_context。
+        # 这里同时设置 strategy.context.sentiment 与 self.sentiment_context，保证两条链都命中。
+        if self.sentiment_context is not None and hasattr(self.strategy, "context"):
+            self.strategy.context.sentiment = self.sentiment_context
+
         self.strategy.on_init()
 
         dts: list = list(self.dts)
@@ -598,6 +609,12 @@ class BacktestingEngine:
                     gateway_name=old_bar.gateway_name
                 )
                 self.bars[vt_symbol] = bar
+
+        # 阶段四：回测时间注入——在每个 Bar 前设置情绪回放时钟，
+        # 使策略/信号器经统一上下文读到当前回测时刻的历史情绪（不读未来）。
+        # 严格顺序：合并当前时间点 Bar → 设置情绪上下文时间 → 撮合 → on_bars。
+        if self.sentiment_context is not None:
+            self.sentiment_context.set_datetime(dt)
 
         self.cross_limit_order()
         self.strategy.on_bars(bars)

@@ -88,6 +88,11 @@ class StrategyEngine(BaseEngine):
         self.database: BaseDatabase = get_database()
         self.datafeed: BaseDatafeed = get_datafeed()
 
+        # 阶段四：统一情绪上下文（实盘由信号器经查找链自动包 LiveSentimentContext；
+        # 回测由回测入口注入 ReplaySentimentContext）。默认 None，实盘时信号器
+        # 落到 MainEngine 实时引擎。
+        self.sentiment_context: Any = None
+
     def init_engine(self) -> None:
         """初始化引擎"""
         self.init_datafeed()

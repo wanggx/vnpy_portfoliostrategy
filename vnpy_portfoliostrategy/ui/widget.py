@@ -189,6 +189,10 @@ class StrategyManager(QtWidgets.QFrame):
         self.edit_button: QtWidgets.QPushButton = QtWidgets.QPushButton(_("编辑"))
         self.edit_button.clicked.connect(self.edit_strategy)
 
+        # 阶段四：策略卡片级"回测"按钮（对照 stage4 原型，非主窗口全局按钮）
+        self.backtest_button: QtWidgets.QPushButton = QtWidgets.QPushButton(_("回测"))
+        self.backtest_button.clicked.connect(self.backtest_strategy)
+
         self.remove_button: QtWidgets.QPushButton = QtWidgets.QPushButton(_("移除"))
         self.remove_button.clicked.connect(self.remove_strategy)
 
@@ -210,6 +214,7 @@ class StrategyManager(QtWidgets.QFrame):
         hbox.addWidget(self.start_button)
         hbox.addWidget(self.stop_button)
         hbox.addWidget(self.edit_button)
+        hbox.addWidget(self.backtest_button)
         hbox.addWidget(self.remove_button)
 
         vbox: QtWidgets.QVBoxLayout = QtWidgets.QVBoxLayout()
@@ -269,6 +274,33 @@ class StrategyManager(QtWidgets.QFrame):
         if n == editor.DialogCode.Accepted:
             setting: dict = editor.get_setting()
             self.strategy_engine.edit_strategy(strategy_name, setting)
+
+    def backtest_strategy(self) -> None:
+        """阶段四：从策略卡片进入单页回测窗口（对照 stage4 原型）。
+
+        自动绑定该策略的 strategy_name / class_name / vt_symbols / 当前参数，
+        打开可最大化的 PortfolioBacktestDialog。
+        """
+        from .backtest_dialog import PortfolioBacktestDialog
+        strategy_name: str = self._data["strategy_name"]
+        class_name: str = self._data["class_name"]
+        # vt_symbols 从策略实例取；策略未初始化时从引擎数据取
+        strategy = self.strategy_engine.strategies.get(strategy_name)
+        if strategy is not None:
+            vt_symbols: list[str] = list(strategy.vt_symbols)
+            setting: dict = dict(self.strategy_engine.get_strategy_parameters(strategy_name))
+        else:
+            vt_symbols = []
+            setting = dict(self._data.get("parameters", {}))
+        dialog: PortfolioBacktestDialog = PortfolioBacktestDialog(
+            self.strategy_engine,
+            strategy_name=strategy_name,
+            strategy_class_name=class_name,
+            vt_symbols=vt_symbols,
+            strategy_setting=setting,
+            parent=self,
+        )
+        dialog.exec_()
 
     def remove_strategy(self) -> None:
         """移除策略"""

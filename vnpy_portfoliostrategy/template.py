@@ -59,6 +59,10 @@ class StrategyContext:
         # 策略独特变量扩展区（任意结构，JSON-safe 部分随策略持久化）
         self.extra_data: dict = {}
 
+        # 阶段四：统一情绪上下文（实盘 LiveSentimentContext / 回测 ReplaySentimentContext）。
+        # 引擎/回测入口注入；策略源文件不直接读它，由信号器经 _get_context 查找链解析。
+        self.sentiment: Any = None
+
     def update_account(self, account: AccountData) -> None:
         """用账户回报更新资金字段。"""
         self.account_id = account.accountid
