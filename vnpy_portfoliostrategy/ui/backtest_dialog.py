@@ -284,21 +284,18 @@ class PortfolioBacktestDialog(QtWidgets.QDialog):
             self._fail_output(f"回测异常：{ex}\n{traceback.format_exc()}")
 
     def _inject_sentiment_context(self, engine: BacktestingEngine) -> None:
-        """注入 ReplaySentimentContext（包 DuckDBSentimentStore 的 reader）。
+        """注入情绪上下文：回测引擎走 make_replay_engine() 统一构造。
 
         无情绪历史时设 None，策略按既有保守降级。不启动 MarketSentimentEngine。
         """
         try:
-            from vnpy.trader.database import get_database
-            from vnpy_marketsentiment.history.store import DuckDBSentimentStore, ReplaySentimentReader
+            from vnpy_marketsentiment import make_replay_engine
             from ..context.sentiment import ReplaySentimentContext
-            db = get_database()
-            conn = getattr(db, "conn", None)
-            if conn is None:
+            replay_engine = make_replay_engine()
+            if replay_engine is None:
+                engine.sentiment_context = None
                 return
-            store = DuckDBSentimentStore(conn)
-            reader = ReplaySentimentReader(store)
-            engine.sentiment_context = ReplaySentimentContext(reader)
+            engine.sentiment_context = ReplaySentimentContext(replay_engine)
         except Exception:  # noqa: BLE001 - 无情绪历史不阻断回测
             engine.sentiment_context = None
 

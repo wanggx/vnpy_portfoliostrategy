@@ -1,47 +1,41 @@
 """统一情绪上下文：实盘与回测共用一个读取接口，策略源文件零修改。
 
-对照 quant-platform-agent-implementation.md 6.2 节：
-- ``SentimentContext`` Protocol：get_latest / get_at / get_sector_sentiment /
-  get_stock_sector / set_datetime。
-- ``LiveSentimentContext``：包装当前 ``MarketSentimentEngine``，``get_latest()``
-  返回实盘当前快照；``set_datetime`` 在实盘无意义（no-op）。
-- ``ReplaySentimentContext``：同时实现 SentimentReader 与 ReplayClock；
-  ``set_datetime(dt)`` 后，``get_latest()`` / ``get_sector_sentiment()`` /
-  ``get_stock_sector()`` 都基于 ``get_at(dt)`` 返回，保证总市场情绪、行业情绪、
-  股票所属行业情绪处于同一个回测时刻。不启动 MarketSentimentEngine 后台线程。
+情绪模块里只有两个引擎：
+
+- ``MarketSentimentEngine``（实盘）：有线程、连 QMT、算当前情绪；
+- ``ReplaySentimentEngine``（回测）：无线程、按回放时钟查历史库。
+
+两者都满足 ``vnpy_marketsentiment.context.SentimentEngine`` 契约
+（``get_latest / get_at / get_sector_sentiment / get_stock_sector / set_datetime``），
+所以这一层只是"类型说明 + 兼容包装"：
+
+- ``SentimentContext``：兼容旧名，等价于 ``SentimentEngine``；
+- ``LiveSentimentContext``：包实盘引擎，``set_datetime`` no-op；
+- ``ReplaySentimentContext``：包回测引擎（推荐）或 ``ReplaySentimentReader``（兼容），
+  ``set_datetime(dt)`` 后所有读取都基于同一回放时刻。
 """
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Protocol
+from typing import Any
 
+from vnpy_marketsentiment.context import SentimentEngine
 from vnpy_marketsentiment.models import (
-    MarketSentimentSnapshot, SectorState, SentimentLevel, MarketBreadth,
+    MarketBreadth,
+    MarketSentimentSnapshot,
+    SectorState,
+    SentimentLevel,
 )
 
+# 兼容旧名：本模块原来自带一份结构相同的 Protocol。
+SentimentContext = SentimentEngine
 
-class SentimentContext(Protocol):
-    """策略读取情绪的统一接口（实盘/回测共用）。"""
-
-    def get_latest(self) -> MarketSentimentSnapshot:
-        """实盘取当前快照；回测取当前回测时刻对应的快照。"""
-        ...
-
-    def get_at(self, when: datetime) -> MarketSentimentSnapshot:
-        """取指定时刻的快照（主要供回测引擎和测试使用）。"""
-        ...
-
-    def get_sector_sentiment(self, sector_name: str) -> SectorState | None:
-        """返回当前上下文时刻某行业的情绪状态。"""
-        ...
-
-    def get_stock_sector(self, symbol: str) -> SectorState | None:
-        """返回当前上下文时刻某标的所属行业的情绪状态。"""
-        ...
-
-    def set_datetime(self, when: datetime) -> None:
-        """由回测引擎在每个 Bar 前设置；实盘实现 no-op。"""
-        ...
+__all__ = [
+    "LiveSentimentContext",
+    "ReplaySentimentContext",
+    "SentimentContext",
+    "SentimentEngine",
+]
 
 
 def _unavailable(when: datetime, error: str) -> MarketSentimentSnapshot:
@@ -78,8 +72,11 @@ class LiveSentimentContext:
     def get_sector_sentiment(self, sector_name: str) -> SectorState | None:
         if self.engine is None:
             return None
-        snap = self.engine.get_latest()
-        return snap.sectors.get(sector_name) if snap else None
+        direct = getattr(self.engine, "get_sector_sentiment", None)
+        if callable(direct):
+            return direct(sector_name)
+        snapshot = self.engine.get_latest()
+        return snapshot.sectors.get(sector_name) if snapshot else None
 
     def get_stock_sector(self, symbol: str) -> SectorState | None:
         if self.engine is None:
@@ -92,22 +89,32 @@ class LiveSentimentContext:
 
 
 class ReplaySentimentContext:
-    """回测情绪上下文：包 ReplaySentimentReader，按回测时钟取历史情绪。
+    """回测情绪上下文：包回测引擎（推荐）或 reader（兼容）。
 
     ``set_datetime(dt)`` 后，``get_latest()`` 调 ``get_at(dt)``，
     ``get_sector_sentiment()`` / ``get_stock_sector()`` 都基于同一回测时刻。
     未设置时钟返回 UNAVAILABLE。不启动实时线程、不连 XtQuant。
     """
 
-    def __init__(self, reader: Any) -> None:
-        """reader 为 ReplaySentimentReader（或任意实现 get_at/get_sector_sentiment/
-        get_stock_sector_mapping 的对象）。"""
-        self.reader = reader
+    def __init__(self, source: Any) -> None:
+        """``source`` 可以是 ``ReplaySentimentEngine``（推荐）或
+        ``ReplaySentimentReader``（兼容旧调用）。"""
+        self.source = source
         self._clock: datetime | None = None
+        # 引擎自带时钟：set_datetime 要同步给它，保证行业读取同一时刻
+        self._engine: Any = (
+            source
+            if callable(getattr(source, "set_datetime", None))
+            and callable(getattr(source, "get_latest", None))
+            else None
+        )
+        self._reader: Any = None if self._engine is not None else source
 
     def set_datetime(self, when: datetime) -> None:
         """由回测引擎在每个 Bar 前调用。"""
         self._clock = when
+        if self._engine is not None:
+            self._engine.set_datetime(when)
 
     def get_latest(self) -> MarketSentimentSnapshot:
         if self._clock is None:
@@ -115,22 +122,28 @@ class ReplaySentimentContext:
         return self.get_at(self._clock)
 
     def get_at(self, when: datetime) -> MarketSentimentSnapshot:
-        if self.reader is None:
+        if self.source is None:
             return _unavailable(when, "无回放情绪 reader")
-        snap = self.reader.get_at(when)
+        snap: MarketSentimentSnapshot | None = self.source.get_at(when)
         if snap is None:
             return _unavailable(when, "该时刻没有预计算的市场情绪")
         return snap
 
     def get_sector_sentiment(self, sector_name: str) -> SectorState | None:
-        if self._clock is None or self.reader is None:
+        if self._clock is None:
             return None
-        return self.reader.get_sector_sentiment(self._clock, sector_name)
+        if self._engine is not None:
+            return self._engine.get_sector_sentiment(sector_name)
+        if self._reader is None:
+            return None
+        return self._reader.get_sector_sentiment(self._clock, sector_name)
 
     def get_stock_sector(self, symbol: str) -> SectorState | None:
         """按当前回测时钟取该标的所属行业情绪。"""
         if self._clock is None:
             return None
+        if self._engine is not None:
+            return self._engine.get_stock_sector(symbol)
         snap = self.get_at(self._clock)
         if not snap.available:
             return None

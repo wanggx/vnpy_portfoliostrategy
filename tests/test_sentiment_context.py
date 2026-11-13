@@ -151,3 +151,56 @@ def test_sentiment_context_protocol_satisfied(store) -> None:
         assert hasattr(ctx, "get_sector_sentiment")
         assert hasattr(ctx, "get_stock_sector")
         assert hasattr(ctx, "set_datetime")
+
+
+def test_live_context_uses_engine_sector_api() -> None:
+    """LiveSentimentContext 优先走引擎新增的 get_sector_sentiment(name)。"""
+    engine = MagicMock()
+    sector = _snapshot(datetime(2024, 1, 2, 9, 31)).sectors["SW2城商行"]
+    engine.get_sector_sentiment.return_value = sector
+
+    ctx = LiveSentimentContext(engine)
+
+    assert ctx.get_sector_sentiment("SW2城商行") is sector
+    engine.get_sector_sentiment.assert_called_once_with("SW2城商行")
+    engine.get_latest.assert_not_called()
+
+
+def test_replay_context_accepts_engine_source(store) -> None:
+    """ReplaySentimentContext 可直接包 ReplaySentimentEngine（推荐用法）。"""
+    from vnpy_marketsentiment import ReplaySentimentEngine
+
+    store.append(_snapshot(
+        datetime(2024, 1, 2, 9, 31), score=55.0, sector_score=72.0,
+        stock_sectors={"600000.SH": ("SW2城商行",)},
+    ))
+    store.append(_snapshot(
+        datetime(2024, 1, 2, 14, 0), score=82.0, sector_score=88.0,
+        stock_sectors={"600000.SH": ("SW2城商行",)},
+    ))
+    engine = ReplaySentimentEngine.from_store(ReplaySentimentReader(store))
+    ctx = ReplaySentimentContext(engine)
+
+    assert ctx.get_latest().level == SentimentLevel.UNAVAILABLE  # 未拨钟
+
+    ctx.set_datetime(datetime(2024, 1, 2, 10, 0))
+    # 时钟同时拨给了引擎本身，两条读取路径一致
+    assert ctx.get_latest().score == 55.0
+    assert engine.get_latest().score == 55.0
+    assert ctx.get_sector_sentiment("SW2城商行").score == 72.0
+    assert ctx.get_stock_sector("600000.SH").score == 72.0
+
+    ctx.set_datetime(datetime(2024, 1, 2, 14, 30))
+    assert ctx.get_latest().score == 82.0
+    assert ctx.get_sector_sentiment("SW2城商行").score == 88.0
+
+
+def test_replay_context_engine_sector_missing_returns_none(store) -> None:
+    """行业不存在时返回 None，不抛异常。"""
+    from vnpy_marketsentiment import ReplaySentimentEngine
+
+    store.append(_snapshot(datetime(2024, 1, 2, 9, 31)))
+    engine = ReplaySentimentEngine.from_store(ReplaySentimentReader(store))
+    ctx = ReplaySentimentContext(engine)
+    ctx.set_datetime(datetime(2024, 1, 2, 9, 45))
+    assert ctx.get_sector_sentiment("不存在") is None

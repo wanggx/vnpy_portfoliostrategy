@@ -1,3 +1,13 @@
+# 1.4.0版本（未发布）
+
+1. 回测情绪统一走 `vnpy_marketsentiment` 的 `SentimentEngine` 契约：实盘
+   `MarketSentimentEngine` 与回测 `ReplaySentimentEngine` 接口对齐
+   （补 `get_sector_sentiment` / `set_datetime` / 生命周期 no-op），策略代码实盘回测同一份。
+2. 回测注入改用 `make_replay_engine()` 统一构造，`ReplaySentimentContext` 可直接包
+   回测引擎（兼容旧的 `ReplaySentimentReader` 写法），避免每个入口各写一份
+   「get_database → DuckDBSentimentStore → ReplaySentimentReader」胶水。
+3. `LiveSentimentContext.get_sector_sentiment` 优先走引擎新接口，不再重复取快照。
+
 # 1.3.0版本
 
 1. 替换send_email为新的send_notification消息发送函数
