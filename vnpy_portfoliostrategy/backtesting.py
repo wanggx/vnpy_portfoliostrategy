@@ -34,6 +34,22 @@ INTERVAL_DELTA_MAP: dict[Interval, timedelta] = {
 }
 
 
+class _BacktestMainEngine:
+    """回测用空主引擎：满足策略侧 get_contract / get_engine 等只读调用。"""
+
+    def get_contract(self, vt_symbol: str) -> Any:
+        return None
+
+    def get_all_positions(self) -> list:
+        return []
+
+    def get_engine(self, name: str) -> Any:
+        return None
+
+    def get_gateway(self, name: str) -> Any:
+        return None
+
+
 class BacktestingEngine:
     """组合策略回测引擎"""
 
@@ -80,6 +96,11 @@ class BacktestingEngine:
         # 阶段四：回测情绪上下文（ReplaySentimentContext），由回测入口注入。
         # 为 None 时信号器无历史情绪，按既有保守降级。不启动 MarketSentimentEngine 后台线程。
         self.sentiment_context: Any = None
+
+        # 与实盘 StrategyEngine 对齐的只读/空操作接口：NearMaSurgeStrategy.on_init
+        # 会读 strategy_data、调 subscribe_symbols；回测无持久化、无真实订阅。
+        self.strategy_data: dict[str, dict] = {}
+        self.main_engine: Any = _BacktestMainEngine()
 
     def clear_data(self) -> None:
         """清理上次回测缓存数据"""
@@ -151,14 +172,13 @@ class BacktestingEngine:
 
         # 每次加载30天历史数据
         progress_delta: timedelta = timedelta(days=30)
-        total_delta: timedelta = self.end - self.start
         interval_delta: timedelta = INTERVAL_DELTA_MAP[self.interval]
 
         for vt_symbol in self.vt_symbols:
+            self.output(_("{}开始加载历史数据").format(vt_symbol))
             if self.interval == Interval.MINUTE:
                 start: datetime = self.start
                 end: datetime = self.start + progress_delta
-                progress: float = 0
 
                 data_count = 0
                 while start < self.end:
@@ -175,13 +195,6 @@ class BacktestingEngine:
                         self.dts.add(bar.datetime)
                         self.history_data[(bar.datetime, vt_symbol)] = bar
                         data_count += 1
-
-                    progress += progress_delta / total_delta
-                    progress = min(progress, 1)
-                    progress_bar = "#" * int(progress * 10)
-                    self.output(_("{}加载进度：{} [{:.0%}]").format(
-                        vt_symbol, progress_bar, progress
-                    ))
 
                     start = end + interval_delta
                     end += (progress_delta + interval_delta)
@@ -757,8 +770,28 @@ class BacktestingEngine:
         pass
 
     def sync_strategy_data(self, strategy: StrategyTemplate) -> None:
-        """保存策略数据到文件"""
+        """保存策略数据到文件（回测不落盘）。"""
         pass
+
+    def subscribe_symbols(
+        self, strategy: StrategyTemplate, vt_symbols: list[str]
+    ) -> None:
+        """回测动态订阅：只扩充策略 vt_symbols，不连行情。"""
+        for vt_symbol in vt_symbols:
+            if vt_symbol and vt_symbol not in strategy.vt_symbols:
+                strategy.vt_symbols.append(vt_symbol)
+
+    def unsubscribe_symbols(
+        self, strategy: StrategyTemplate, vt_symbols: list[str]
+    ) -> None:
+        """回测动态退订：从策略 vt_symbols 移除。"""
+        for vt_symbol in vt_symbols:
+            if vt_symbol in strategy.vt_symbols:
+                strategy.vt_symbols.remove(vt_symbol)
+
+    def init_t1_position(self, strategy: StrategyTemplate) -> None:
+        """回测无经纪商持仓，T+1 同步空操作。"""
+        return
 
     def get_engine_type(self) -> EngineType:
         """获取引擎类型"""

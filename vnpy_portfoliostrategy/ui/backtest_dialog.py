@@ -40,6 +40,12 @@ class PortfolioBacktestDialog(QtWidgets.QDialog):
         ("1d", Interval.DAILY),
     ]
 
+    # 后台线程 -> UI：复杂结果不走 Signal(object)（Queued 常丢），用无参 finished + 成员暂存
+    signal_log: QtCore.Signal = QtCore.Signal(str)
+    signal_status: QtCore.Signal = QtCore.Signal(str)
+    signal_progress: QtCore.Signal = QtCore.Signal(int)
+    signal_finished: QtCore.Signal = QtCore.Signal()
+
     def __init__(
         self,
         strategy_engine: Any,
@@ -60,8 +66,24 @@ class PortfolioBacktestDialog(QtWidgets.QDialog):
         self._status: str = BacktestStatus.IDLE
         self._engine: BacktestingEngine | None = None
         self._stop_flag: bool = False
+        self._progress_phase: str = "idle"
+        self._symbols_done: int = 0
+        self._symbols_total: int = 1
+        self._progress_value: int = 0
+        self._pending_stats: dict = {}
+        self._pending_trades: dict = {}
+        self._pending_logs: list = []
+        self._pending_daily: Any = None
+        self._output_logs: list[str] = []
+        self._trades: dict = {}
+        self._logs: list = []
+        self._daily_df: Any = None
 
         self._init_ui()
+        self.signal_log.connect(self._append_log)
+        self.signal_status.connect(self._set_status_slot)
+        self.signal_progress.connect(self._set_progress)
+        self.signal_finished.connect(self._on_finished)
 
     def _init_ui(self) -> None:
         self.setWindowTitle(f"组合策略回测 - {self.strategy_name}")
@@ -106,16 +128,19 @@ class PortfolioBacktestDialog(QtWidgets.QDialog):
         config_row.addStretch()
         config_row.addWidget(self.run_button)
 
-        # 2. 运行状态栏
+        # 2. 运行状态栏：进度一行，提示单独下一行，避免右侧文案刷新挤闪进度条
         self.status_label: QtWidgets.QLabel = QtWidgets.QLabel(f"状态：{BacktestStatus.IDLE}")
         self.progress_bar: QtWidgets.QProgressBar = QtWidgets.QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.detail_status: QtWidgets.QLabel = QtWidgets.QLabel("")
+        self.detail_status.setWordWrap(True)
 
         status_row: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
         status_row.addWidget(self.status_label)
         status_row.addWidget(self.progress_bar, 1)
-        status_row.addWidget(self.detail_status)
+
+        tip_row: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
+        tip_row.addWidget(self.detail_status, 1)
 
         # 3. 指标区
         self.metrics_label: QtWidgets.QLabel = QtWidgets.QLabel("指标：--")
@@ -155,6 +180,7 @@ class PortfolioBacktestDialog(QtWidgets.QDialog):
         vbox: QtWidgets.QVBoxLayout = QtWidgets.QVBoxLayout()
         vbox.addLayout(config_row)
         vbox.addLayout(status_row)
+        vbox.addLayout(tip_row)
         vbox.addWidget(self.metrics_label)
         vbox.addWidget(detail_split, 1)
         vbox.addLayout(bottom_row)
@@ -220,8 +246,19 @@ class PortfolioBacktestDialog(QtWidgets.QDialog):
             return
         self._stop_flag = False
         self._set_status(BacktestStatus.RUNNING)
+        self._progress_phase = "load"
+        self._symbols_done = 0
+        self._symbols_total = max(1, len(self.vt_symbols))
+        self._progress_value = 0
+        self._output_logs = []
+        self._pending_stats = {}
+        self._pending_trades = {}
+        self._pending_logs = []
+        self._pending_daily = None
         self.progress_bar.setValue(0)
+        self.metrics_label.setText("指标：--")
         self.detail_status.setText("")
+        self.detail_table.setRowCount(0)
 
         # 后台线程执行回测
         import threading
@@ -262,23 +299,39 @@ class PortfolioBacktestDialog(QtWidgets.QDialog):
                 return
             engine.add_strategy(strategy_class, self.strategy_setting)
 
+            self._progress_phase = "load"
             engine.load_data()
             if not engine.history_data:
                 self._fail_output("DuckDB 无可用行情数据，回测终止")
                 return
 
+            self._progress_phase = "replay"
+            self.signal_progress.emit(60)
             engine.run_backtesting()
 
             if self._stop_flag:
-                self._on_status(BacktestStatus.STOPPED)
-                self._on_detail("停止回测，已保留已完成结果")
+                self.signal_status.emit(BacktestStatus.STOPPED)
+                self.signal_log.emit("停止回测，已保留已完成结果")
             else:
+                self._progress_phase = "stats"
+                self.signal_progress.emit(90)
                 df = engine.calculate_result()
-                stats = engine.calculate_statistics(df, output=False)
-                self._on_metrics(stats)
-                self._on_trades(engine.trades)
-                self._on_logs(engine.logs)
-                self._on_status(BacktestStatus.COMPLETED)
+                stats = engine.calculate_statistics(df, output=False) or {}
+                # 结果先落到成员，再无参通知主线程渲染（避免 Signal(object) 排队丢失）
+                self._pending_stats = {
+                    k: (v.item() if hasattr(v, "item") else v)
+                    for k, v in dict(stats).items()
+                }
+                self._pending_trades = dict(engine.trades)
+                # 引擎 output + 策略 write_log 合并，避免策略无日志时明细页空白
+                merged_logs = list(self._output_logs)
+                for msg in engine.logs:
+                    merged_logs.append(str(msg))
+                self._pending_logs = merged_logs
+                self._pending_daily = df
+                self.signal_progress.emit(100)
+                self.signal_finished.emit()
+                self.signal_status.emit(BacktestStatus.COMPLETED)
         except Exception as ex:  # noqa: BLE001
             import traceback
             self._fail_output(f"回测异常：{ex}\n{traceback.format_exc()}")
@@ -307,71 +360,95 @@ class PortfolioBacktestDialog(QtWidgets.QDialog):
     # -- 结果回传到 UI 线程 --------------------------------------------
 
     def _on_output(self, msg: str) -> None:
-        """回测引擎输出 -> 日志明细（线程安全经 signal）。"""
-        QtCore.QMetaObject.invokeMethod(
-            self, "_append_log", QtCore.Qt.ConnectionType.QueuedConnection,
-            QtCore.Q_ARG(str, str(msg)),
-        )
+        """回测引擎输出 -> 日志 + 单调进度（线程安全经 Signal）。"""
+        text = str(msg)
+        self._output_logs.append(text)
+        self.signal_log.emit(text)
+        self._update_progress_from_log(text)
+
+    def _update_progress_from_log(self, msg: str) -> None:
+        """一次回测只走 0→100：加载按「已完成标的数/总数」映射到 0–60。
+
+        不再解析每个标的自己的 ``[0%]…[100%]``——那会把总进度条打成反复冲顶。
+        """
+        if self._progress_phase == "load":
+            if "历史数据加载完成" in msg and "所有" not in msg:
+                self._symbols_done = min(
+                    self._symbols_done + 1, self._symbols_total
+                )
+                overall = int(self._symbols_done / self._symbols_total * 60)
+                self.signal_progress.emit(max(1, min(60, overall)))
+                return
+            if "所有历史数据加载完成" in msg:
+                self.signal_progress.emit(60)
+                return
+        if "策略初始化完成" in msg:
+            self.signal_progress.emit(65)
+        elif "开始回放历史数据" in msg:
+            self._progress_phase = "replay"
+            self.signal_progress.emit(70)
+        elif "历史数据回放结束" in msg:
+            self.signal_progress.emit(88)
+
+    @QtCore.Slot(int)
+    def _set_progress(self, value: int) -> None:
+        """进度只增不减；归零只在主线程点「开始回测」时做。"""
+        value = max(0, min(100, int(value)))
+        if value <= self._progress_value:
+            return
+        self._progress_value = value
+        self.progress_bar.setValue(value)
 
     @QtCore.Slot(str)
     def _append_log(self, msg: str) -> None:
         if self._status == BacktestStatus.RUNNING:
-            self.detail_status.setText(msg[:80])
-        # 进度估算：日志含"数据加载完成"/"回测完成"等
-        if "完成" in msg:
-            self.progress_bar.setValue(min(100, self.progress_bar.value() + 20))
+            self.detail_status.setText(str(msg)[:80])
 
     def _on_status(self, status: str) -> None:
-        QtCore.QMetaObject.invokeMethod(
-            self, "_set_status_slot", QtCore.Qt.ConnectionType.QueuedConnection,
-            QtCore.Q_ARG(str, status),
-        )
+        self.signal_status.emit(status)
 
     @QtCore.Slot(str)
     def _set_status_slot(self, status: str) -> None:
         self._set_status(status)
         if status == BacktestStatus.COMPLETED:
+            self._progress_value = 100
             self.progress_bar.setValue(100)
 
     def _fail_output(self, msg: str) -> None:
-        self._on_output(msg)
-        self._on_status(BacktestStatus.FAILED)
+        self.signal_log.emit(msg)
+        self.signal_status.emit(BacktestStatus.FAILED)
 
-    def _on_metrics(self, stats: dict) -> None:
-        QtCore.QMetaObject.invokeMethod(
-            self, "_render_metrics", QtCore.Qt.ConnectionType.QueuedConnection,
-            QtCore.Q_ARG(object, stats),
-        )
+    @QtCore.Slot()
+    def _on_finished(self) -> None:
+        """主线程取回测结果并刷新明细。"""
+        self._trades = dict(self._pending_trades or {})
+        self._logs = list(self._pending_logs or [])
+        self._daily_df = self._pending_daily
+        self._render_metrics(dict(self._pending_stats or {}))
+        self._switch_detail(self.detail_list.currentRow())
+        self._progress_value = 100
+        self.progress_bar.setValue(100)
 
-    @QtCore.Slot(object)
     def _render_metrics(self, stats: dict) -> None:
-        keys = ["total_return", "annual_return", "max_drawdown", "sharpe_ratio", "trade_count"]
-        parts = [f"{k}={stats.get(k, 'N/A')}" for k in keys]
-        self.metrics_label.setText("指标：" + "  ".join(parts))
-
-    def _on_trades(self, trades: dict) -> None:
-        QtCore.QMetaObject.invokeMethod(
-            self, "_render_trades", QtCore.Qt.ConnectionType.QueuedConnection,
-            QtCore.Q_ARG(object, trades),
-        )
-
-    @QtCore.Slot(object)
-    def _render_trades(self, trades: dict) -> None:
-        self._trades = trades
-        if self.detail_list.currentRow() == 0:
-            self._switch_detail(0)
-
-    def _on_logs(self, logs: list) -> None:
-        QtCore.QMetaObject.invokeMethod(
-            self, "_render_logs", QtCore.Qt.ConnectionType.QueuedConnection,
-            QtCore.Q_ARG(object, logs),
-        )
-
-    @QtCore.Slot(object)
-    def _render_logs(self, logs: list) -> None:
-        self._logs = logs
-        if self.detail_list.currentRow() == 3:
-            self._switch_detail(3)
+        keys = [
+            ("total_return", "总收益"),
+            ("annual_return", "年化"),
+            ("max_drawdown", "最大回撤"),
+            ("sharpe_ratio", "Sharpe"),
+            ("total_trade_count", "成交笔数"),
+        ]
+        parts: list[str] = []
+        for key, label in keys:
+            value = stats.get(key, "N/A")
+            if isinstance(value, float):
+                parts.append(f"{label}={value:.4g}")
+            else:
+                parts.append(f"{label}={value}")
+        trade_count = stats.get("total_trade_count", 0) or 0
+        suffix = ""
+        if not trade_count:
+            suffix = "  （无成交：可能未触发信号或标的/区间无匹配行情）"
+        self.metrics_label.setText("指标：" + "  ".join(parts) + suffix)
 
     @QtCore.Slot(int)
     def _switch_detail(self, row: int) -> None:
@@ -383,7 +460,14 @@ class PortfolioBacktestDialog(QtWidgets.QDialog):
             self.detail_table.setHorizontalHeaderLabels(
                 ["成交时间", "标的", "方向", "数量", "价格", "成交金额"]
             )
-            for t in getattr(self, "_trades", {}).values():
+            trades = getattr(self, "_trades", {}) or {}
+            if not trades:
+                self.detail_table.setRowCount(1)
+                self.detail_table.setItem(
+                    0, 0, QtWidgets.QTableWidgetItem("本次回测无成交记录")
+                )
+                return
+            for t in trades.values():
                 r = self.detail_table.rowCount()
                 self.detail_table.insertRow(r)
                 self.detail_table.setItem(r, 0, QtWidgets.QTableWidgetItem(str(t.datetime)))
@@ -392,10 +476,60 @@ class PortfolioBacktestDialog(QtWidgets.QDialog):
                 self.detail_table.setItem(r, 3, QtWidgets.QTableWidgetItem(str(t.volume)))
                 self.detail_table.setItem(r, 4, QtWidgets.QTableWidgetItem(str(t.price)))
                 self.detail_table.setItem(r, 5, QtWidgets.QTableWidgetItem(str(t.volume * t.price)))
+        elif row == 1:  # 每日收益
+            self.detail_table.setColumnCount(4)
+            self.detail_table.setHorizontalHeaderLabels(
+                ["日期", "成交笔数", "净盈亏", "日收益率"]
+            )
+            df = getattr(self, "_daily_df", None)
+            if df is None or getattr(df, "empty", True):
+                self.detail_table.setRowCount(1)
+                self.detail_table.setItem(
+                    0, 0, QtWidgets.QTableWidgetItem("无每日收益（通常因无成交）")
+                )
+                return
+            for idx, row_data in df.iterrows():
+                r = self.detail_table.rowCount()
+                self.detail_table.insertRow(r)
+                self.detail_table.setItem(r, 0, QtWidgets.QTableWidgetItem(str(idx)))
+                self.detail_table.setItem(
+                    r, 1, QtWidgets.QTableWidgetItem(str(row_data.get("trade_count", "")))
+                )
+                self.detail_table.setItem(
+                    r, 2, QtWidgets.QTableWidgetItem(f"{float(row_data.get('net_pnl', 0)):.2f}")
+                )
+                ret = row_data.get("return", None)
+                self.detail_table.setItem(
+                    r, 3,
+                    QtWidgets.QTableWidgetItem(
+                        f"{float(ret):.6f}" if ret is not None else ""
+                    ),
+                )
+        elif row == 2:  # 情绪数据
+            self.detail_table.setColumnCount(1)
+            self.detail_table.setHorizontalHeaderLabels(["说明"])
+            self.detail_table.setRowCount(1)
+            has_sentiment = (
+                self._engine is not None
+                and getattr(self._engine, "sentiment_context", None) is not None
+            )
+            text = (
+                "已注入历史情绪上下文（按 Bar 时间回放）"
+                if has_sentiment
+                else "未注入情绪历史：信号按无情绪保守降级"
+            )
+            self.detail_table.setItem(0, 0, QtWidgets.QTableWidgetItem(text))
         elif row == 3:  # 回测日志
             self.detail_table.setColumnCount(1)
             self.detail_table.setHorizontalHeaderLabels(["日志"])
-            for msg in getattr(self, "_logs", []):
+            logs = getattr(self, "_logs", []) or []
+            if not logs:
+                self.detail_table.setRowCount(1)
+                self.detail_table.setItem(
+                    0, 0, QtWidgets.QTableWidgetItem("无策略日志")
+                )
+                return
+            for msg in logs:
                 r = self.detail_table.rowCount()
                 self.detail_table.insertRow(r)
                 self.detail_table.setItem(r, 0, QtWidgets.QTableWidgetItem(str(msg)))
