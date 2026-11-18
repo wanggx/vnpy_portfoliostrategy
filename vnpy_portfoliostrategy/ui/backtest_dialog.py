@@ -9,8 +9,9 @@
 """
 from __future__ import annotations
 
+from bisect import bisect_left
 from datetime import date, datetime
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pyqtgraph as pg
@@ -61,6 +62,114 @@ QSplitter::handle:hover {
   background-color: #3b82f6;
 }
 """
+
+
+class _CurveHoverHelper(QtCore.QObject):
+    """曲线 hover：十字线 + 吸附点 + 日期/数值气泡。"""
+
+    def __init__(
+        self,
+        plot: pg.PlotWidget,
+        *,
+        value_name: str,
+        value_fmt: Callable[[float], str],
+        color: str,
+        parent: QtCore.QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.plot = plot
+        self.value_name = value_name
+        self.value_fmt = value_fmt
+        self.color = color
+        self.xs: list[float] = []
+        self.ys: list[float] = []
+
+        pen = pg.mkPen("#e8eaed", width=1, style=QtCore.Qt.PenStyle.DashLine)
+        self.vline = pg.InfiniteLine(angle=90, movable=False, pen=pen)
+        self.hline = pg.InfiniteLine(angle=0, movable=False, pen=pen)
+        for line in (self.vline, self.hline):
+            line.setZValue(20)
+            line.setVisible(False)
+            plot.addItem(line, ignoreBounds=True)
+
+        self.marker = pg.ScatterPlotItem(
+            size=10,
+            pen=pg.mkPen("#12141a", width=1),
+            brush=pg.mkBrush(color),
+        )
+        self.marker.setZValue(21)
+        plot.addItem(self.marker)
+
+        self.label = pg.TextItem(
+            anchor=(0, 1),
+            color="#12141a",
+            fill=pg.mkBrush("#ffe082"),
+            border=pg.mkPen("#ffe082"),
+        )
+        self.label.setZValue(22)
+        self.label.setVisible(False)
+        plot.addItem(self.label, ignoreBounds=True)
+
+        plot.scene().sigMouseMoved.connect(self._on_mouse_moved)
+        plot.viewport().installEventFilter(self)
+
+    def set_data(self, xs: list[float], ys: list[float]) -> None:
+        self.xs = list(xs)
+        self.ys = list(ys)
+        self.hide()
+
+    def hide(self) -> None:
+        self.vline.setVisible(False)
+        self.hline.setVisible(False)
+        self.label.setVisible(False)
+        self.marker.setData([], [])
+
+    def eventFilter(self, obj: QtCore.QObject, event: QtCore.QEvent) -> bool:  # noqa: N802
+        if event.type() == QtCore.QEvent.Type.Leave:
+            self.hide()
+        return super().eventFilter(obj, event)
+
+    def _on_mouse_moved(self, pos: QtCore.QPointF) -> None:
+        if not self.xs or not self.ys:
+            self.hide()
+            return
+        if not self.plot.sceneBoundingRect().contains(pos):
+            self.hide()
+            return
+
+        point = self.plot.getViewBox().mapSceneToView(pos)
+        idx = self._nearest_index(point.x())
+        x = self.xs[idx]
+        y = self.ys[idx]
+
+        self.vline.setPos(x)
+        self.hline.setPos(y)
+        self.vline.setVisible(True)
+        self.hline.setVisible(True)
+        self.marker.setData([x], [y])
+
+        try:
+            date_text = datetime.fromtimestamp(x).strftime("%Y-%m-%d")
+        except (OverflowError, OSError, ValueError):
+            date_text = str(x)
+
+        self.label.setHtml(
+            f"<div style='padding:2px 4px;'>"
+            f"<b>{date_text}</b><br>{self.value_name}  {self.value_fmt(y)}"
+            f"</div>"
+        )
+        self.label.setPos(x, y)
+        self.label.setVisible(True)
+
+    def _nearest_index(self, x: float) -> int:
+        i = bisect_left(self.xs, x)
+        if i <= 0:
+            return 0
+        if i >= len(self.xs):
+            return len(self.xs) - 1
+        before = self.xs[i - 1]
+        after = self.xs[i]
+        return i if (after - x) < (x - before) else i - 1
 
 
 # 回测任务状态机
@@ -181,13 +290,16 @@ class PortfolioBacktestDialog(QtWidgets.QDialog):
         self.progress_bar.setRange(0, 100)
         self.detail_status: QtWidgets.QLabel = QtWidgets.QLabel("")
         self.detail_status.setWordWrap(True)
+        self.detail_status.setAlignment(
+            QtCore.Qt.AlignmentFlag.AlignVCenter | QtCore.Qt.AlignmentFlag.AlignLeft
+        )
 
+        # 左半：状态+进度条；右半：提示文案
         status_row: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
+        status_row.setSpacing(10)
         status_row.addWidget(self.status_label)
         status_row.addWidget(self.progress_bar, 1)
-
-        tip_row: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
-        tip_row.addWidget(self.detail_status, 1)
+        status_row.addWidget(self.detail_status, 1)
 
         # 3. 指标区：5 个大卡片
         self._kpi_values: dict[str, QtWidgets.QLabel] = {}
@@ -218,6 +330,20 @@ class PortfolioBacktestDialog(QtWidgets.QDialog):
             fillLevel=0,
             brush=pg.mkBrush(255, 107, 107, 70),
             name="回撤",
+        )
+        self._equity_hover = _CurveHoverHelper(
+            self.equity_plot,
+            value_name="净值",
+            value_fmt=lambda v: f"{v:.4f}",
+            color=_EQUITY_COLOR,
+            parent=self,
+        )
+        self._drawdown_hover = _CurveHoverHelper(
+            self.drawdown_plot,
+            value_name="回撤",
+            value_fmt=lambda v: f"{v:.2f}%",
+            color=_DRAWDOWN_COLOR,
+            parent=self,
         )
         chart_split: QtWidgets.QSplitter = QtWidgets.QSplitter(
             QtCore.Qt.Orientation.Horizontal
@@ -287,7 +413,6 @@ class PortfolioBacktestDialog(QtWidgets.QDialog):
         vbox: QtWidgets.QVBoxLayout = QtWidgets.QVBoxLayout()
         vbox.addLayout(config_row)
         vbox.addLayout(status_row)
-        vbox.addLayout(tip_row)
         vbox.addLayout(kpi_row)
         vbox.addWidget(self._mid_split, 1)
         vbox.addLayout(bottom_row)
@@ -642,6 +767,8 @@ class PortfolioBacktestDialog(QtWidgets.QDialog):
             label.setStyleSheet(f"{_KPI_VALUE_STYLE} color: {_KPI_FLAT};")
         self._equity_curve.setData([], [])
         self._drawdown_curve.setData([], [])
+        self._equity_hover.set_data([], [])
+        self._drawdown_hover.set_data([], [])
 
     def _render_metrics(self, stats: dict) -> None:
         """刷新 5 个大指标卡。"""
@@ -697,6 +824,8 @@ class PortfolioBacktestDialog(QtWidgets.QDialog):
         if df is None or getattr(df, "empty", True):
             self._equity_curve.setData([], [])
             self._drawdown_curve.setData([], [])
+            self._equity_hover.set_data([], [])
+            self._drawdown_hover.set_data([], [])
             return
 
         xs: list[float] = []
@@ -732,14 +861,18 @@ class PortfolioBacktestDialog(QtWidgets.QDialog):
             self._equity_curve.setFillLevel(min(equity))
             self._equity_curve.setData(xs, equity)
             self.equity_plot.setLabel("left", "净值")
+            self._equity_hover.set_data(xs, equity)
         else:
             self._equity_curve.setData([], [])
+            self._equity_hover.set_data([], [])
 
         if drawdown and len(drawdown) == len(xs):
             self._drawdown_curve.setData(xs, drawdown)
             self.drawdown_plot.setLabel("left", "回撤 %")
+            self._drawdown_hover.set_data(xs, drawdown)
         else:
             self._drawdown_curve.setData([], [])
+            self._drawdown_hover.set_data([], [])
 
     @QtCore.Slot(int)
     def _switch_detail(self, row: int) -> None:
@@ -761,12 +894,24 @@ class PortfolioBacktestDialog(QtWidgets.QDialog):
             for t in trades.values():
                 r = self.detail_table.rowCount()
                 self.detail_table.insertRow(r)
-                self.detail_table.setItem(r, 0, QtWidgets.QTableWidgetItem(str(t.datetime)))
+                dt = t.datetime
+                if isinstance(dt, datetime):
+                    dt_text = dt.strftime("%Y-%m-%d %H:%M:%S")
+                else:
+                    dt_text = str(dt)[:19]
+                amount = float(t.volume) * float(t.price)
+                self.detail_table.setItem(r, 0, QtWidgets.QTableWidgetItem(dt_text))
                 self.detail_table.setItem(r, 1, QtWidgets.QTableWidgetItem(t.vt_symbol))
                 self.detail_table.setItem(r, 2, QtWidgets.QTableWidgetItem(str(t.direction.value)))
                 self.detail_table.setItem(r, 3, QtWidgets.QTableWidgetItem(str(t.volume)))
-                self.detail_table.setItem(r, 4, QtWidgets.QTableWidgetItem(str(t.price)))
-                self.detail_table.setItem(r, 5, QtWidgets.QTableWidgetItem(str(t.volume * t.price)))
+                self.detail_table.setItem(r, 4, QtWidgets.QTableWidgetItem(f"{float(t.price):.2f}"))
+                self.detail_table.setItem(r, 5, QtWidgets.QTableWidgetItem(f"{amount:.2f}"))
+            self.detail_table.resizeColumnToContents(0)
+            self.detail_table.resizeColumnToContents(1)
+            # 标的列默认再放宽一点，避免 600259.SSE 被截断
+            self.detail_table.setColumnWidth(
+                1, max(140, self.detail_table.columnWidth(1) + 24)
+            )
         elif row == 1:  # 每日收益
             self.detail_table.setColumnCount(4)
             self.detail_table.setHorizontalHeaderLabels(
