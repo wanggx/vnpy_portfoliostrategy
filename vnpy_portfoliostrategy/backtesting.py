@@ -1,5 +1,5 @@
 from collections import defaultdict
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from functools import lru_cache, partial
 from copy import copy
 import traceback
@@ -33,9 +33,29 @@ INTERVAL_DELTA_MAP: dict[Interval, timedelta] = {
     Interval.DAILY: timedelta(days=1),
 }
 
+# xtquant 代码后缀 -> vnpy Exchange.value（与 NearMaSurgeStrategy 对齐）
+_XT_SUFFIX_EXCHANGE: dict[str, str] = {
+    ".SH": "SSE",
+    ".SZ": "SZSE",
+    ".BJ": "BSE",
+}
+
+
+def _xt_code_to_vt_symbol(code: str) -> str:
+    """000001.SZ → 000001.SZSE；无法识别返回空串。"""
+    text: str = str(code).strip()
+    for suffix, exchange in _XT_SUFFIX_EXCHANGE.items():
+        if text.endswith(suffix):
+            return f"{text[: -len(suffix)]}.{exchange}"
+    return ""
+
 
 class _BacktestMainEngine:
     """回测用空主引擎：满足策略侧 get_contract / get_engine 等只读调用。"""
+
+    def __init__(self, sql_engine: Any = None) -> None:
+        # 注入实盘 SqlApp，供 NearMaSurgeStrategy.refresh_universe 查 stock_near_ma
+        self._sql_engine: Any = sql_engine
 
     def get_contract(self, vt_symbol: str) -> Any:
         return None
@@ -44,6 +64,10 @@ class _BacktestMainEngine:
         return []
 
     def get_engine(self, name: str) -> Any:
+        if self._sql_engine is None:
+            return None
+        if name == getattr(self._sql_engine, "engine_name", None):
+            return self._sql_engine
         return None
 
     def get_gateway(self, name: str) -> Any:
@@ -101,6 +125,9 @@ class BacktestingEngine:
         # 会读 strategy_data、调 subscribe_symbols；回测无持久化、无真实订阅。
         self.strategy_data: dict[str, dict] = {}
         self.main_engine: Any = _BacktestMainEngine()
+        # 按自然日回放：交易日列表；当日已加载行情的标的
+        self.trading_days: list[date] = []
+        self._day_loaded: set[str] = set()
 
     def clear_data(self) -> None:
         """清理上次回测缓存数据"""
@@ -114,6 +141,8 @@ class BacktestingEngine:
         self.logs.clear()
         self.daily_results.clear()
         self.daily_df = None
+        self.trading_days.clear()
+        self._day_loaded.clear()
 
     def set_parameters(
         self,
@@ -156,8 +185,8 @@ class BacktestingEngine:
         )
 
     def load_data(self) -> None:
-        """加载历史数据"""
-        self.output(_("开始加载历史数据"))
+        """准备回测：只生成交易日序列，不预载全区间行情（按天边取边放）。"""
+        self.output(_("开始准备回测交易日"))
 
         if not self.end:
             self.end = datetime.now()
@@ -166,101 +195,224 @@ class BacktestingEngine:
             self.output(_("起始日期必须小于结束日期"))
             return
 
-        # 清理上次加载的历史数据
         self.history_data.clear()
         self.dts.clear()
+        self.trading_days.clear()
+        self._day_loaded.clear()
 
-        # 每次加载30天历史数据
-        progress_delta: timedelta = timedelta(days=30)
-        interval_delta: timedelta = INTERVAL_DELTA_MAP[self.interval]
+        self.trading_days = self._build_trading_days()
+        if not self.trading_days:
+            self.output(_("未找到回测区间内的交易日"))
+            return
+        self.output(
+            _("按自然日回放：共 {} 个交易日（{} ~ {}）").format(
+                len(self.trading_days),
+                self.trading_days[0].isoformat(),
+                self.trading_days[-1].isoformat(),
+            )
+        )
 
-        for vt_symbol in self.vt_symbols:
-            self.output(_("{}开始加载历史数据").format(vt_symbol))
-            if self.interval == Interval.MINUTE:
-                start: datetime = self.start
-                end: datetime = self.start + progress_delta
+    def _build_trading_days(self) -> list[date]:
+        """用 DuckDB 日线日期并集作为交易日（轻量，不读分钟线）。"""
+        database: BaseDatabase = get_database()
+        if not hasattr(database, "conn") or not hasattr(database, "lock"):
+            return []
+        sql: str = """
+            SELECT DISTINCT CAST(datetime AS DATE) AS d
+            FROM dbbardata
+            WHERE interval = ?
+              AND exchange IN ('SSE', 'SZSE')
+              AND datetime >= ?
+              AND datetime <= ?
+            ORDER BY d
+        """
+        params: tuple = (
+            Interval.DAILY.value,
+            self.start.replace(hour=0, minute=0, second=0),
+            self.end,
+        )
+        try:
+            with database.lock:  # type: ignore[attr-defined]
+                cursor = database.conn.cursor()  # type: ignore[attr-defined]
+                try:
+                    rows = cursor.execute(sql, params).fetchall()
+                finally:
+                    cursor.close()
+        except Exception as exc:  # noqa: BLE001
+            self.output(_("生成交易日失败：{}").format(exc))
+            return []
 
-                data_count = 0
-                while start < self.end:
-                    end = min(end, self.end)
-
-                    data: list[BarData] = load_bar_data(
-                        vt_symbol,
-                        self.interval,
-                        start,
-                        end
-                    )
-
-                    for bar in data:
-                        self.dts.add(bar.datetime)
-                        self.history_data[(bar.datetime, vt_symbol)] = bar
-                        data_count += 1
-
-                    start = end + interval_delta
-                    end += (progress_delta + interval_delta)
+        days: list[date] = []
+        for row in rows:
+            value = row[0]
+            if isinstance(value, datetime):
+                days.append(value.date())
+            elif isinstance(value, date):
+                days.append(value)
             else:
-                data = load_bar_data(
-                    vt_symbol,
-                    self.interval,
-                    self.start,
-                    self.end
-                )
+                days.append(datetime.strptime(str(value)[:10], "%Y-%m-%d").date())
+        return days
 
-                for bar in data:
-                    self.dts.add(bar.datetime)
-                    self.history_data[(bar.datetime, vt_symbol)] = bar
+    def _register_symbol(self, vt_symbol: str) -> bool:
+        """登记合约到引擎列表与默认费率；已存在返回 False。"""
+        if not vt_symbol or vt_symbol in self.vt_symbols:
+            return False
+        self.vt_symbols.append(vt_symbol)
+        self.rates.setdefault(vt_symbol, 0.0)
+        self.slippages.setdefault(vt_symbol, 0.0)
+        self.sizes.setdefault(vt_symbol, 1.0)
+        self.priceticks.setdefault(vt_symbol, 0.01)
+        return True
 
-                data_count = len(data)
+    def _active_symbols(self) -> set[str]:
+        """当前应关注的标的：策略订阅 ∪ 有持仓。"""
+        active: set[str] = set(self.strategy.vt_symbols)
+        for vt_symbol, pos in self.strategy.pos_data.items():
+            if pos:
+                active.add(vt_symbol)
+        return active
 
-            self.output(_("{}历史数据加载完成，数据量：{}").format(vt_symbol, data_count))
+    def _near_ma_pool_for_day(self, day: date) -> set[str]:
+        """会话日对应的选股池（取 stock_near_ma 中严格小于该日的最大 trade_date）。"""
+        strategy: StrategyTemplate | None = getattr(self, "strategy", None)
+        if strategy is None:
+            return set()
+        sector: str = str(getattr(strategy, "industry_name", "") or "").strip()
+        table: str = str(getattr(strategy, "TABLE_NAME", "") or "").strip()
+        if not sector or not table:
+            return set()
+        try:
+            from vnpy_sqlapp import APP_NAME as _SQLAPP_NAME
+        except Exception:  # noqa: BLE001
+            return set()
+        sql_engine = self.main_engine.get_engine(_SQLAPP_NAME)
+        if sql_engine is None:
+            return set()
 
-        self.output(_("所有历史数据加载完成"))
+        asof: str = day.strftime("%Y%m%d")
+        try:
+            trade_date = sql_engine.scalar(
+                f"SELECT MAX(trade_date) FROM {table} "
+                f"WHERE sector_name = ? AND trade_date < ?",
+                (sector, asof),
+            )
+            if not trade_date:
+                return set()
+            rows: list[dict] = sql_engine.query_all(
+                f"SELECT code FROM {table} "
+                f"WHERE sector_name = ? AND trade_date = ?",
+                (sector, str(trade_date)),
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.output(_("取当日选股池失败 {}：{}").format(asof, exc))
+            return set()
+
+        pool: set[str] = set()
+        for row in rows:
+            vt_symbol: str = _xt_code_to_vt_symbol(str(row.get("code", "")))
+            if vt_symbol:
+                pool.add(vt_symbol)
+        return pool
+
+    def _load_symbol_day(self, vt_symbol: str, day: date) -> int:
+        """加载某标的某一个自然日的行情到 history_data，返回根数。"""
+        key: str = f"{vt_symbol}:{day.isoformat()}"
+        if key in self._day_loaded:
+            return 0
+        day_start: datetime = datetime.combine(day, time.min)
+        day_end: datetime = datetime.combine(day, time(23, 59, 59))
+        data: list[BarData] = load_bar_data(
+            vt_symbol, self.interval, day_start, day_end
+        )
+        for bar in data:
+            self.history_data[(bar.datetime, vt_symbol)] = bar
+        self._day_loaded.add(key)
+        self._register_symbol(vt_symbol)
+        return len(data)
+
+    def _prepare_day(self, day: date) -> list[datetime]:
+        """取一天行情：选股池 ∪ 当前订阅 ∪ 持仓；返回当日时间戳序列。"""
+        self._day_loaded.clear()
+        symbols: set[str] = self._active_symbols() | self._near_ma_pool_for_day(day)
+        if not symbols:
+            # 无池时至少用引擎初始标的撑开当日时间轴
+            symbols = set(self.vt_symbols)
+
+        total_bars: int = 0
+        for vt_symbol in sorted(symbols):
+            total_bars += self._load_symbol_day(vt_symbol, day)
+
+        day_dts: list[datetime] = sorted(
+            {
+                dt
+                for dt, _symbol in self.history_data.keys()
+                if dt.date() == day
+            }
+        )
+        self.output(
+            _("{}：加载 {} 个标的、{} 根K线、{} 个时点").format(
+                day.isoformat(), len(symbols), total_bars, len(day_dts)
+            )
+        )
+        return day_dts
+
+    def _release_day(self, day: date) -> None:
+        """释放当日 history，控制内存。"""
+        stale: list[tuple] = [
+            key for key in self.history_data if key[0].date() == day
+        ]
+        for key in stale:
+            self.history_data.pop(key, None)
+        # 清掉当日推送缓存；持仓标的下一交易日会重新加载
+        self.bars.clear()
+        self._day_loaded.clear()
 
     def run_backtesting(self) -> None:
-        """开始回测"""
+        """按自然日：一天取数 → 按时间回放 → 释放，再下一天。"""
         # 阶段四：把回测情绪上下文同步到策略 context，供信号器经查找链解析。
-        # 信号器优先级：显式 context → strategy.context.sentiment → strategy_engine.sentiment_context。
-        # 这里同时设置 strategy.context.sentiment 与 self.sentiment_context，保证两条链都命中。
         if self.sentiment_context is not None and hasattr(self.strategy, "context"):
             self.strategy.context.sentiment = self.sentiment_context
 
+        if not self.trading_days:
+            self.output(_("无交易日，回测终止"))
+            return
+
         self.strategy.on_init()
 
-        dts: list = list(self.dts)
-        dts.sort()
+        # 组合策略通常 days=0；若 >0 则前 N 个交易日只预热不交易
+        warmup_days: int = max(0, int(self.days))
+        if warmup_days <= 0:
+            self.strategy.inited = True
+            self.strategy.on_start()
+            self.strategy.trading = True
+            self.output(_("策略初始化完成，开始按日回放"))
+        else:
+            self.output(_("策略预热 {} 个交易日").format(warmup_days))
 
-        # 使用指定时间的历史数据初始化策略
-        day_count: int = 0
-        _ix: int = 0
-
-        for _ix, dt in enumerate(dts):
-            if self.datetime and dt.day != self.datetime.day:
-                day_count += 1
-                if day_count >= self.days:
-                    break
-
+        for index, day in enumerate(self.trading_days, start=1):
             try:
-                self.new_bars(dt)
+                day_dts: list[datetime] = self._prepare_day(day)
+                for dt in day_dts:
+                    self.new_bars(dt)
             except Exception:
                 self.output(_("触发异常，回测终止"))
                 self.output(traceback.format_exc())
+                self._release_day(day)
                 return
 
-        self.strategy.inited = True
-        self.output(_("策略初始化完成"))
+            if not self.strategy.inited and index >= warmup_days:
+                self.strategy.inited = True
+                self.strategy.on_start()
+                self.strategy.trading = True
+                self.output(_("策略初始化完成，开始交易回放"))
 
-        self.strategy.on_start()
-        self.strategy.trading = True
-        self.output(_("开始回放历史数据"))
-
-        # 使用剩余历史数据进行策略回测
-        for dt in dts[_ix:]:
-            try:
-                self.new_bars(dt)
-            except Exception:
-                self.output(_("触发异常，回测终止"))
-                self.output(traceback.format_exc())
-                return
+            self._release_day(day)
+            if index % 5 == 0 or index == len(self.trading_days):
+                self.output(
+                    _("回放进度：{}/{} 日（当前 {}）").format(
+                        index, len(self.trading_days), day.isoformat()
+                    )
+                )
 
         self.output(_("历史数据回放结束"))
 
@@ -594,11 +746,20 @@ class BacktestingEngine:
             self.daily_results[d] = PortfolioDailyResult(d, close_prices)
 
     def new_bars(self, dt: datetime) -> None:
-        """历史数据推送"""
+        """历史数据推送。
+
+        只向「当前订阅 ∪ 有持仓」推送 bars，与实盘动态订阅一致；全市场预加载的
+        其它标的留在 history_data，等日切 subscribe 后再进推送集。
+        """
         self.datetime = dt
 
+        active: set[str] = set(self.strategy.vt_symbols)
+        for vt_symbol, pos in self.strategy.pos_data.items():
+            if pos:
+                active.add(vt_symbol)
+
         bars: dict[str, BarData] = {}
-        for vt_symbol in self.vt_symbols:
+        for vt_symbol in active:
             bar: BarData | None = self.history_data.get((dt, vt_symbol), None)
 
             # 判断是否获取到该合约指定时间的历史数据
@@ -707,6 +868,22 @@ class BacktestingEngine:
         """加载历史数据"""
         self.days = days
 
+    def query_bar_from_datafeed(
+        self,
+        symbol: str,
+        exchange: Any,
+        interval: Interval,
+        start: datetime,
+        end: datetime,
+    ) -> list[BarData]:
+        """回测侧对齐实盘接口：无外部 datafeed，直接读 vnpy.duckdb。"""
+        from vnpy.trader.constant import Exchange as ExchangeEnum
+
+        ex: ExchangeEnum = (
+            exchange if isinstance(exchange, ExchangeEnum) else ExchangeEnum(str(exchange))
+        )
+        return load_bar_data(f"{symbol}.{ex.value}", interval, start, end)
+
     def send_order(
         self,
         strategy: StrategyTemplate,
@@ -720,7 +897,7 @@ class BacktestingEngine:
         mark: str = ""
     ) -> list[str]:
         """发送委托"""
-        price = round_to(price, self.priceticks[vt_symbol])
+        price = round_to(price, self.priceticks.get(vt_symbol, 0.01))
         symbol, exchange = extract_vt_symbol(vt_symbol)
 
         self.limit_order_count += 1
@@ -776,15 +953,25 @@ class BacktestingEngine:
     def subscribe_symbols(
         self, strategy: StrategyTemplate, vt_symbols: list[str]
     ) -> None:
-        """回测动态订阅：只扩充策略 vt_symbols，不连行情。"""
+        """回测动态订阅：登记列表，并补载「当前回放日」行情。"""
+        day: date | None = (
+            self.datetime.date()
+            if isinstance(self.datetime, datetime) and self.datetime.year > 1970
+            else None
+        )
         for vt_symbol in vt_symbols:
-            if vt_symbol and vt_symbol not in strategy.vt_symbols:
+            if not vt_symbol:
+                continue
+            if vt_symbol not in strategy.vt_symbols:
                 strategy.vt_symbols.append(vt_symbol)
+            self._register_symbol(vt_symbol)
+            if day is not None:
+                self._load_symbol_day(vt_symbol, day)
 
     def unsubscribe_symbols(
         self, strategy: StrategyTemplate, vt_symbols: list[str]
     ) -> None:
-        """回测动态退订：从策略 vt_symbols 移除。"""
+        """回测动态退订：从策略 vt_symbols 移除（历史与引擎列表保留供持仓用）。"""
         for vt_symbol in vt_symbols:
             if vt_symbol in strategy.vt_symbols:
                 strategy.vt_symbols.remove(vt_symbol)
@@ -799,11 +986,11 @@ class BacktestingEngine:
 
     def get_pricetick(self, strategy: StrategyTemplate, vt_symbol: str) -> float:
         """获取合约价格跳动"""
-        return self.priceticks[vt_symbol]
+        return float(self.priceticks.get(vt_symbol, 0.01))
 
     def get_size(self, strategy: StrategyTemplate, vt_symbol: str) -> float:
         """获取合约乘数"""
-        return self.sizes[vt_symbol]
+        return float(self.sizes.get(vt_symbol, 1.0))
 
     def put_strategy_event(self, strategy: StrategyTemplate) -> None:
         """推送事件更新策略界面"""

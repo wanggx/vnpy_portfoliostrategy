@@ -1,11 +1,10 @@
-from datetime import date, datetime, time, timedelta
+from datetime import datetime, time, timedelta
 
 import numpy as np
 
-from vnpy.trader.constant import Exchange, Direction, Status
+from vnpy.trader.constant import Exchange, Direction, Status, Interval
 from vnpy.trader.object import TickData, BarData, TradeData, OrderData
-
-from bigqmt_signal_trader.xtquant_compat import xtdata
+from vnpy.trader.utility import extract_vt_symbol
 
 from vnpy_sqlapp import APP_NAME as SQLAPP_NAME
 
@@ -53,11 +52,14 @@ class NearMaSurgeStrategy(StrategyTemplate):
     拒/撤单也先登记，其余离场由成交回报登记；盘前刷新时清掉已过期的记录，避免持久化
     数据无限增长。
 
-    布林上轨止盈（兜底）：每日盘前按**当天可卖出的持仓**批量取**前复权**日线，算当日
-    日线布林上轨（MA + boll_dev × σ，σ 用总体标准差，与 ``ArrayManager.boll`` 同口径）
-    存入 ``boll_up``；盘中现价触及上轨且当前收益不低于 ``BOLL_MIN_PROFIT_PCT``（默认 5%）
+    布林上轨止盈（兜底）：每日盘前按**当天可卖出的持仓**批量取日线，算当日日线布林上轨
+    （MA + boll_dev × σ，σ 用总体标准差，与 ``ArrayManager.boll`` 同口径）存入
+    ``boll_up``；盘中现价触及上轨且当前收益不低于 ``BOLL_MIN_PROFIT_PCT``（默认 5%）
     时全清（收益不足不卖：含亏损时的反弹假突破）。它排在价格卖出之后，只在未触发止损、
     未达 10%/20% 止盈档、未回撤、未跌破保底时生效（即 5% ≤ 收益 < 10%）。
+    日线经 ``strategy_engine.query_bar_from_datafeed``（实盘走 datafeed；回测同名方法
+    读 DuckDB）；前一交易日由策略查 ``stock_near_ma``；回测用引擎时钟
+    ``strategy_engine.datetime``。
 
     资金约束：本策略**总占用资金**（持仓成本 + 在途买单）不超过 ``max_cash`` 元上限，
     单笔买入仍是 ``fixed_size`` 股，不按单笔金额限制。资金校验由买入链尾的
@@ -142,7 +144,7 @@ class NearMaSurgeStrategy(StrategyTemplate):
     # 收益门槛：不足此值不按上轨卖（含亏损——挡反弹假突破；也避免只赚一两点就离场）
     BOLL_MIN_PROFIT_PCT: float = 0.05
     BOLL_LOOKBACK_DAYS: int = 60             # 取数回溯自然日（≈40 交易日，含节假日/停牌冗余）
-    BOLL_DIVIDEND_TYPE: str = "front"        # 前复权（可切 "front_ratio" 等比前复权）
+    # 日线经 strategy_engine.query_bar_from_datafeed（不再策略内直连 xtdata）
 
     parameters: list = [
         "industry_name",
@@ -225,6 +227,16 @@ class NearMaSurgeStrategy(StrategyTemplate):
         # 最近一次刷新布林上轨的日期（YYYYMMDD）：内存标记（非持久化变量），
         # 盘中重启当天也会补算一次，不会整天没有上轨
         self.boll_date: str = ""
+
+        # 回测 on_bars→tick 用：昨收（当日首根前一交易日收盘）与上一根收盘
+        self._bar_day: dict[str, str] = {}
+        self._day_pre_close: dict[str, float] = {}
+        self._last_bar_close: dict[str, float] = {}
+
+    def _now(self) -> datetime:
+        """策略时钟：回测用 ``strategy_engine.datetime``，实盘用墙钟。"""
+        dt = getattr(self.strategy_engine, "datetime", None)
+        return dt if isinstance(dt, datetime) else datetime.now()
 
     def on_init(self) -> None:
         """策略初始化回调
@@ -386,7 +398,7 @@ class NearMaSurgeStrategy(StrategyTemplate):
         """刷新节流：查空/异常后按 ``REFRESH_RETRY_SEC`` 重试一次，避免每 tick 打数据库"""
         if self.last_refresh_attempt is None:
             return True
-        elapsed: float = (datetime.now() - self.last_refresh_attempt).total_seconds()
+        elapsed: float = (self._now() - self.last_refresh_attempt).total_seconds()
         return elapsed >= self.REFRESH_RETRY_SEC
 
     def _is_trading_session(self, tick: TickData) -> bool:
@@ -559,8 +571,45 @@ class NearMaSurgeStrategy(StrategyTemplate):
         )
 
     def on_bars(self, bars: dict[str, BarData]) -> None:
-        """K线切片回调（本策略拉升检测走 tick，此处留空）"""
-        return
+        """K线切片回调：回测引擎只推 bars，合成 tick 后复用 ``on_tick`` 全链路。
+
+        每根 K 线用收盘价生成一根合成 tick（带推算的 ``pre_close``），再走日切 /
+        买卖信号 / 下单。实盘仍由网关推真实 tick，一般不会进这里。
+        """
+        for bar in bars.values():
+            if bar.close_price <= 0:
+                continue
+            tick: TickData = self._bar_to_tick(bar)
+            # 与实盘 process_tick_event 对齐：先刷 last_prices 再进 on_tick
+            self.context.last_prices[tick.vt_symbol] = tick.last_price
+            self.on_tick(tick)
+
+    def _bar_to_tick(self, bar: BarData) -> TickData:
+        """Bar → 合成 Tick：last=收盘价；跨日时用上一交易日最后收盘作 pre_close。"""
+        vt_symbol: str = bar.vt_symbol
+        day: str = bar.datetime.strftime("%Y%m%d")
+        if self._bar_day.get(vt_symbol) != day:
+            if vt_symbol in self._last_bar_close:
+                self._day_pre_close[vt_symbol] = self._last_bar_close[vt_symbol]
+            self._bar_day[vt_symbol] = day
+
+        tick: TickData = TickData(
+            symbol=bar.symbol,
+            exchange=bar.exchange,
+            datetime=bar.datetime,
+            name="",
+            last_price=bar.close_price,
+            open_price=bar.open_price,
+            high_price=bar.high_price,
+            low_price=bar.low_price,
+            volume=bar.volume,
+            turnover=bar.turnover,
+            open_interest=bar.open_interest,
+            pre_close=self._day_pre_close.get(vt_symbol, 0.0),
+            gateway_name=bar.gateway_name,
+        )
+        self._last_bar_close[vt_symbol] = bar.close_price
+        return tick
 
     def update_trade(self, trade: TradeData) -> None:
         """成交数据更新：维护开仓价，平仓后清理止盈追踪，推送企业微信通知"""
@@ -629,7 +678,7 @@ class NearMaSurgeStrategy(StrategyTemplate):
         """每日刷新标的池：按前一交易日查库取当日成分 → 订阅新标的 → 退订不在池中且无持仓的旧标的
 
         DB 数据按前一交易日生成（screening 基于前一交易日收盘价），因此取数日期
-        取前一交易日（由大 QMT 交易日历给出，自动跨越周末/节假日）。
+        取前一交易日（策略查 ``stock_near_ma`` 的 MAX(trade_date)）。
         若前一交易日查不到数据，不做任何订阅/退订处理，维持昨天的订阅数据（现有订阅保持不变）；
         此时若标的池为空（手工清过持久化数据 / 首次初始化），回退为当前订阅集合，
         避免空池让买入判定全天静默短路。
@@ -640,14 +689,14 @@ class NearMaSurgeStrategy(StrategyTemplate):
 
         # 记录本次尝试时间：查空/异常时不写 last_refresh_date，on_tick 会按
         # REFRESH_RETRY_SEC 节流重试（09:15 后数据才落地的场景）
-        self.last_refresh_attempt = datetime.now()
+        self.last_refresh_attempt = self._now()
 
         # 取数日期：DB 数据按前一交易日生成，直接查前一交易日的行
-        today: str = datetime.now().strftime("%Y%m%d")
-        t_trade_date: datetime = datetime.now()
+        today: str = self._now().strftime("%Y%m%d")
+        t_trade_date: datetime = self._now()
         trade_date: str = self._previous_trade_date()
         self.write_log(
-            f"刷新-取前一交易日耗时 {(datetime.now() - t_trade_date).total_seconds():.2f}s "
+            f"刷新-取前一交易日耗时 {(self._now() - t_trade_date).total_seconds():.2f}s "
             f"trade_date={trade_date}"
         )
         sector: str = self.industry_name.replace("'", "''")
@@ -658,17 +707,17 @@ class NearMaSurgeStrategy(StrategyTemplate):
             f"FROM {self.TABLE_NAME} "
             f"WHERE sector_name = '{sector}' AND trade_date = '{trade_date}'"
         )
-        t_query: datetime = datetime.now()
+        t_query: datetime = self._now()
         try:
             rows: list[dict] = sql_engine.query_all(sql)
             self.write_log(
-                f"刷新-数据库查询耗时 {(datetime.now() - t_query).total_seconds():.2f}s "
+                f"刷新-数据库查询耗时 {(self._now() - t_query).total_seconds():.2f}s "
                 f"返回 {len(rows)} 行"
             )
         except Exception as exc:  # noqa: BLE001 - 查询失败写日志，不影响策略运行
             self.write_log(
                 f"查询 {self.TABLE_NAME} 失败（耗时 "
-                f"{(datetime.now() - t_query).total_seconds():.2f}s）：{exc}"
+                f"{(self._now() - t_query).total_seconds():.2f}s）：{exc}"
             )
             return
 
@@ -756,11 +805,9 @@ class NearMaSurgeStrategy(StrategyTemplate):
     def _refresh_boll_bands(self) -> None:
         """盘前刷新当日布林上轨：只算"当天可卖出的持仓"，整体替换 ``self.boll_up``。
 
-        只算可卖持仓：当日买入的（今仓）T+1 不可卖、无持仓的标的走不到卖出分支，给它们
-        算上轨没有意义（白花取数时间）。取数用**前复权**日线：前复权序列的最后一根 =
-        最新真实价，与盘中 tick 同尺度，窗口内有除权的票也不会出现"上轨高高飘着、永远
-        碰不到"。取不到 / 日线不足 ``boll_window`` 根 / 全 0（前复权数据未落地）的标的
-        写 0（不可用），由卖出信号降级不产出。
+        日线经 ``strategy_engine.query_bar_from_datafeed``（与 ``load_bar`` 同源接口；
+        回测引擎同名方法读 DuckDB）。end 取策略时钟的前一自然日。取不到 / 不足
+        ``boll_window`` / 价格异常则不上轨。
 
         取数失败只记日志，**绝不抛异常**：``call_strategy_func`` 会把异常当致命错误
         停掉整个策略。
@@ -769,71 +816,58 @@ class NearMaSurgeStrategy(StrategyTemplate):
             vt_symbol for vt_symbol, pos in self.pos_data.items()
             if pos > 0 and self.get_sellable(vt_symbol) > 0
         ]
-        # 大 QMT 代码 -> vt_symbol；拿不到代码的标的取不到数据，直接跳过
-        codes: dict[str, str] = {}
-        for vt_symbol in targets:
-            code: str = self._vt_symbol_to_code(vt_symbol)
-            if code:
-                codes[code] = vt_symbol
-        if not codes:
+        if not targets:
             self.boll_up = {}
             return
 
-        t: datetime = datetime.now()
-        # end 取昨天：不依赖数据源过滤当日未完成日线，盘中重启去算也仍是"昨日及以前"的上轨
-        end: str = (date.today() - timedelta(days=1)).strftime("%Y%m%d")
-        start: str = (
-            date.today() - timedelta(days=self.BOLL_LOOKBACK_DAYS)
-        ).strftime("%Y%m%d")
+        t: datetime = self._now()
+        end_dt: datetime = (t - timedelta(days=1)).replace(
+            hour=23, minute=59, second=59, microsecond=0
+        )
+        start_dt: datetime = (t - timedelta(days=self.BOLL_LOOKBACK_DAYS)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+
+        bands: dict[str, float] = {}
+        empty: list[str] = []
         try:
-            data: dict = xtdata.get_market_data_ex(
-                field_list=[],
-                stock_list=list(codes.keys()),
-                period="1d",
-                start_time=start,
-                end_time=end,
-                count=-1,
-                dividend_type=self.BOLL_DIVIDEND_TYPE,
-                fill_data=False,
-            ) or {}
+            for vt_symbol in targets:
+                symbol, exchange = extract_vt_symbol(vt_symbol)
+                bars: list[BarData] = self.strategy_engine.query_bar_from_datafeed(
+                    symbol, exchange, Interval.DAILY, start_dt, end_dt
+                )
+                up: float = self._boll_upper_from_bars(bars)
+                if up > 0:
+                    bands[vt_symbol] = up
+                else:
+                    empty.append(vt_symbol)
         except Exception as exc:  # noqa: BLE001 - 取数失败不影响策略运行
             self.boll_up = {}
             self.write_log(f"布林上轨取数失败，当日不启用该兜底止盈：{exc}")
             return
 
-        bands: dict[str, float] = {}
-        empty: list[str] = []
-        for code, vt_symbol in codes.items():
-            up: float = self._boll_upper(data.get(code))
-            if up > 0:
-                bands[vt_symbol] = up
-            else:
-                empty.append(vt_symbol)
         self.boll_up = bands
-
         msg: str = (
             f"布林上轨刷新 {len(bands)}/{len(targets)} 只，"
-            f"耗时 {(datetime.now() - t).total_seconds():.2f}s"
+            f"耗时 {(self._now() - t).total_seconds():.2f}s"
         )
         if empty:
-            # 无上轨的标的当日退化为"没有该兜底止盈"（止损等其它档不受影响）
             msg += f"，无上轨 {len(empty)} 只（{'、'.join(empty[:5])}）"
         self.write_log(msg)
 
-    def _boll_upper(self, df) -> float:
-        """由前复权日线收盘价算布林上轨；样本不足或价格异常（含前复权全 0）返回 0。
-
-        与 ``vnpy.trader.utility.ArrayManager.boll`` 同口径：均值 = 收盘价简单均值，
-        标准差用**总体标准差**（``ddof=0``，对应 ``talib.STDDEV(nbdev=1)``）；用 pandas
-        默认的 ``ddof=1`` 会与其它策略的 ``am.boll`` 数值不一致。
-        """
-        if df is None or "close" not in getattr(df, "columns", ()):
+    def _boll_upper_from_bars(self, bars: list[BarData]) -> float:
+        """由日线 ``BarData`` 收盘价算布林上轨；样本不足或价格异常返回 0。"""
+        if not bars:
             return 0.0
-        closes = np.asarray(df["close"].to_numpy(), dtype=float)[-self.boll_window:]
+        closes = np.asarray(
+            [float(bar.close_price) for bar in bars], dtype=float
+        )[-self.boll_window:]
+        return self._boll_upper_closes(closes)
+
+    def _boll_upper_closes(self, closes: np.ndarray) -> float:
+        """与 ``ArrayManager.boll`` 同口径：均值 + boll_dev × 总体标准差（ddof=0）。"""
         if closes.size < self.boll_window:
             return 0.0
-        # 前复权取数在服务端原始日线/除权因子未落地时会返回全 0（实测），必须挡住，
-        # 否则会算出 0 或负的上轨
         if not np.isfinite(closes).all() or (closes <= 0).any():
             return 0.0
         return float(closes.mean()) + self.boll_dev * float(closes.std(ddof=0))
@@ -857,51 +891,28 @@ class NearMaSurgeStrategy(StrategyTemplate):
         return sql_engine
 
     def _previous_trade_date(self) -> str:
-        """前一交易日（严格小于今天的最大交易日，A 股自动跨越周末/节假日）
+        """前一交易日（严格小于策略时钟「今天」的最大选股日）。
 
-        经大 QMT RPC 桥 ``xtdata.get_trading_dates`` 取 SH 日历。
-        RPC 失败时回退为跳过周末的近似值。
+        优先 SqlApp 查 ``stock_near_ma`` 的 MAX(trade_date)；无引擎/无行时回退跳过周末。
         """
-        today: datetime = datetime.now()
-        today_str: str = today.strftime("%Y%m%d")
-        try:
-            # 往前看 15 天，足够跨越周末和长假（春节/国庆最长 7 天）
-            start: str = (today - timedelta(days=15)).strftime("%Y%m%d")
-            dates = xtdata.get_trading_dates(
-                "SH", start_time=start, end_time=today_str, count=-1
-            )
-            trade_days: list[str] = [
-                day for day in (self._as_yyyymmdd(item) for item in (dates or []))
-                if day
-            ]
-            prev_days: list[str] = [d for d in trade_days if d < today_str]
-            if prev_days:
-                return max(prev_days)
-            self.write_log("交易日历未返回小于今天的交易日，回退近似前一交易日")
-        except Exception as exc:  # noqa: BLE001 - 回退近似值，不影响策略运行
-            self.write_log(f"交易日历取前一交易日失败，回退近似：{exc}")
-        # 回退：往回跳过周末（不考虑节假日）
-        d: datetime = today - timedelta(days=1)
-        while d.weekday() >= 5:  # 5=周六, 6=周日
+        asof: datetime = self._now()
+        asof_str: str = asof.strftime("%Y%m%d")
+        sql_engine = self._get_sql_engine()
+        if sql_engine is not None:
+            try:
+                value = sql_engine.scalar(
+                    f"SELECT MAX(trade_date) FROM {self.TABLE_NAME} "
+                    f"WHERE trade_date < ?",
+                    (asof_str,),
+                )
+                if value:
+                    return str(value)
+            except Exception as exc:  # noqa: BLE001 - 回退近似日历
+                self.write_log(f"查选股表取前一交易日失败，回退近似：{exc}")
+        d: datetime = asof - timedelta(days=1)
+        while d.weekday() >= 5:
             d -= timedelta(days=1)
         return d.strftime("%Y%m%d")
-
-    @staticmethod
-    def _as_yyyymmdd(value) -> str:
-        """兼容 MiniQMT 毫秒时间戳和大 QMT 的 YYYYMMDD 字符串。"""
-        if isinstance(value, datetime):
-            return value.strftime("%Y%m%d")
-        if isinstance(value, str):
-            digits: str = "".join(ch for ch in value if ch.isdigit())
-            return digits[:8] if len(digits) >= 8 else ""
-        number: int = int(value)
-        if number >= 10**12:
-            return datetime.fromtimestamp(number / 1000.0).strftime("%Y%m%d")
-        if number >= 10**9:
-            return datetime.fromtimestamp(float(number)).strftime("%Y%m%d")
-        if 19_000_000 <= number <= 21_000_000:
-            return f"{number:08d}"
-        return ""
 
     @staticmethod
     def _code_to_vt_symbol(code: str) -> str:

@@ -9,14 +9,58 @@
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
+
+import numpy as np
+import pyqtgraph as pg
 
 from vnpy.trader.ui import QtWidgets, QtCore, QtGui
 from vnpy.trader.constant import Interval
 
 from ..backtesting import BacktestingEngine
 from ..template import StrategyTemplate
+
+
+# 仅装饰指标卡/曲线；其余控件跟 VeighNa 全局主题，避免整窗换皮发花
+_KPI_UP = "#3ddc97"
+_KPI_DOWN = "#ff6b6b"
+_KPI_FLAT = "#e8eaed"
+_EQUITY_COLOR = "#4fc3f7"
+_DRAWDOWN_COLOR = "#ff6b6b"
+_CHART_BG = "#12141a"
+_CHART_BORDER = "#2a2f3a"
+_CHART_AXIS = "#8b93a7"
+_KPI_BOX_STYLE = (
+    "QFrame#kpiCard {"
+    "  background-color: #1b1e26;"
+    "  border: 1px solid #2a2f3a;"
+    "  border-radius: 8px;"
+    "}"
+)
+_KPI_TITLE_STYLE = "font-size: 13px; color: #9aa3b2;"
+_KPI_VALUE_STYLE = "font-size: 28px; font-weight: 700;"
+_CHART_BOX_STYLE = (
+    "QFrame#chartPanel {"
+    f"  background-color: {_CHART_BG};"
+    f"  border: 1px solid {_CHART_BORDER};"
+    "  border-radius: 6px;"
+    "}"
+)
+_SPLITTER_STYLE = """
+QSplitter::handle {
+  background-color: #2a2f3a;
+}
+QSplitter::handle:horizontal {
+  width: 1px;
+}
+QSplitter::handle:vertical {
+  height: 1px;
+}
+QSplitter::handle:hover {
+  background-color: #3b82f6;
+}
+"""
 
 
 # 回测任务状态机
@@ -78,6 +122,7 @@ class PortfolioBacktestDialog(QtWidgets.QDialog):
         self._trades: dict = {}
         self._logs: list = []
         self._daily_df: Any = None
+        self._did_layout_splitters: bool = False
 
         self._init_ui()
         self.signal_log.connect(self._append_log)
@@ -87,10 +132,14 @@ class PortfolioBacktestDialog(QtWidgets.QDialog):
 
     def _init_ui(self) -> None:
         self.setWindowTitle(f"组合策略回测 - {self.strategy_name}")
-        self.setMinimumSize(1400, 900)
-        self.setWindowFlag(QtCore.Qt.WindowType.Window, True)
-        self.setWindowFlag(QtCore.Qt.WindowType.WindowMinMaxButtonsHint, True)
-        self.setWindowFlag(QtCore.Qt.WindowType.WindowCloseButtonHint, True)
+        self.setMinimumSize(1100, 700)
+        # 独立顶层窗口，才能稳定最大化（挂在策略卡片 parent 上时常失败）
+        self.setWindowFlags(
+            QtCore.Qt.WindowType.Window
+            | QtCore.Qt.WindowType.WindowMinimizeButtonHint
+            | QtCore.Qt.WindowType.WindowMaximizeButtonHint
+            | QtCore.Qt.WindowType.WindowCloseButtonHint
+        )
 
         # 1. 配置栏
         self.strategy_label: QtWidgets.QLabel = QtWidgets.QLabel(
@@ -108,7 +157,6 @@ class PortfolioBacktestDialog(QtWidgets.QDialog):
         self.end_date.setDate(QtCore.QDate.currentDate())
         self.end_date.setDisplayFormat("yyyy-MM-dd")
         self.market_db_label: QtWidgets.QLabel = QtWidgets.QLabel("行情数据：vnpy.duckdb")
-        self.sentiment_db_label: QtWidgets.QLabel = QtWidgets.QLabel("情绪数据：vnpy.duckdb")
         self.quality_label: QtWidgets.QLabel = QtWidgets.QLabel("数据质量：--")
 
         self.run_button: QtWidgets.QPushButton = QtWidgets.QPushButton("开始回测")
@@ -123,7 +171,6 @@ class PortfolioBacktestDialog(QtWidgets.QDialog):
         config_row.addWidget(QtWidgets.QLabel("结束"))
         config_row.addWidget(self.end_date)
         config_row.addWidget(self.market_db_label)
-        config_row.addWidget(self.sentiment_db_label)
         config_row.addWidget(self.quality_label)
         config_row.addStretch()
         config_row.addWidget(self.run_button)
@@ -142,28 +189,88 @@ class PortfolioBacktestDialog(QtWidgets.QDialog):
         tip_row: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
         tip_row.addWidget(self.detail_status, 1)
 
-        # 3. 指标区
-        self.metrics_label: QtWidgets.QLabel = QtWidgets.QLabel("指标：--")
-        self.metrics_label.setWordWrap(True)
+        # 3. 指标区：5 个大卡片
+        self._kpi_values: dict[str, QtWidgets.QLabel] = {}
+        kpi_row: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
+        kpi_row.setSpacing(12)
+        for key, title in (
+            ("total_return", "总收益"),
+            ("max_ddpercent", "最大回撤"),
+            ("annual_return", "年化收益"),
+            ("sharpe_ratio", "夏普比率"),
+            ("total_trade_count", "成交次数"),
+        ):
+            card, value_label = self._make_kpi_card(title)
+            self._kpi_values[key] = value_label
+            kpi_row.addWidget(card, 1)
 
-        # 4. 明细区：左侧列表 + 右侧表格
+        # 4. 曲线区：资金曲线 | 回撤曲线
+        self.equity_plot: pg.PlotWidget = self._make_curve_plot()
+        self.drawdown_plot: pg.PlotWidget = self._make_curve_plot()
+        self._equity_curve: pg.PlotDataItem = self.equity_plot.plot(
+            pen=pg.mkPen(_EQUITY_COLOR, width=2),
+            fillLevel=1.0,
+            brush=pg.mkBrush(79, 195, 247, 55),
+            name="策略净值",
+        )
+        self._drawdown_curve: pg.PlotDataItem = self.drawdown_plot.plot(
+            pen=pg.mkPen(_DRAWDOWN_COLOR, width=2),
+            fillLevel=0,
+            brush=pg.mkBrush(255, 107, 107, 70),
+            name="回撤",
+        )
+        chart_split: QtWidgets.QSplitter = QtWidgets.QSplitter(
+            QtCore.Qt.Orientation.Horizontal
+        )
+        chart_split.setHandleWidth(1)
+        chart_split.setStyleSheet(_SPLITTER_STYLE)
+        chart_split.addWidget(self._wrap_plot("资金曲线", self.equity_plot))
+        chart_split.addWidget(self._wrap_plot("回撤曲线", self.drawdown_plot))
+        chart_split.setChildrenCollapsible(False)
+        chart_split.setStretchFactor(0, 1)
+        chart_split.setStretchFactor(1, 1)
+        chart_split.setMinimumHeight(160)
+
+        # 5. 明细区：左侧列表 + 细 splitter + 右侧表格（列表跟全局主题，不单独换皮）
         self.detail_list: QtWidgets.QListWidget = QtWidgets.QListWidget()
         self.detail_list.addItem("成交明细")
         self.detail_list.addItem("每日收益")
-        self.detail_list.addItem("情绪数据")
         self.detail_list.addItem("回测日志")
         self.detail_list.setCurrentRow(0)
+        self.detail_list.setMaximumWidth(140)
         self.detail_list.currentRowChanged.connect(self._switch_detail)
+
         self.detail_table: QtWidgets.QTableWidget = QtWidgets.QTableWidget()
         self.detail_table.horizontalHeader().setStretchLastSection(True)
+        self.detail_table.verticalHeader().setVisible(False)
+        self.detail_table.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
 
-        detail_split: QtWidgets.QSplitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
-        detail_split.addWidget(self.detail_list)
-        detail_split.addWidget(self.detail_table)
-        detail_split.setStretchFactor(0, 1)
-        detail_split.setStretchFactor(1, 5)
+        self._detail_split: QtWidgets.QSplitter = QtWidgets.QSplitter(
+            QtCore.Qt.Orientation.Horizontal
+        )
+        self._detail_split.setHandleWidth(1)
+        self._detail_split.setStyleSheet(_SPLITTER_STYLE)
+        self._detail_split.addWidget(self.detail_list)
+        self._detail_split.addWidget(self.detail_table)
+        self._detail_split.setChildrenCollapsible(False)
+        self._detail_split.setStretchFactor(0, 0)
+        self._detail_split.setStretchFactor(1, 1)
 
-        # 5. 底部操作区
+        self._mid_split: QtWidgets.QSplitter = QtWidgets.QSplitter(
+            QtCore.Qt.Orientation.Vertical
+        )
+        self._mid_split.setHandleWidth(1)
+        self._mid_split.setStyleSheet(_SPLITTER_STYLE)
+        self._mid_split.addWidget(chart_split)
+        self._mid_split.addWidget(self._detail_split)
+        self._mid_split.setChildrenCollapsible(False)
+        self._mid_split.setStretchFactor(0, 2)
+        self._mid_split.setStretchFactor(1, 3)
+
+        # 6. 底部操作区
         self.stop_button: QtWidgets.QPushButton = QtWidgets.QPushButton("停止回测")
         self.stop_button.clicked.connect(self._on_stop)
         self.export_button: QtWidgets.QPushButton = QtWidgets.QPushButton("导出报告")
@@ -181,12 +288,97 @@ class PortfolioBacktestDialog(QtWidgets.QDialog):
         vbox.addLayout(config_row)
         vbox.addLayout(status_row)
         vbox.addLayout(tip_row)
-        vbox.addWidget(self.metrics_label)
-        vbox.addWidget(detail_split, 1)
+        vbox.addLayout(kpi_row)
+        vbox.addWidget(self._mid_split, 1)
         vbox.addLayout(bottom_row)
         self.setLayout(vbox)
 
+        self._clear_metrics_and_charts()
         self._update_buttons()
+        self._switch_detail(0)
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:  # type: ignore[override]
+        """首次显示后按比例压低曲线区，给表格留空。"""
+        super().showEvent(event)
+        if self._did_layout_splitters:
+            return
+        self._did_layout_splitters = True
+        QtCore.QTimer.singleShot(0, self._apply_splitter_sizes)
+
+    def _apply_splitter_sizes(self) -> None:
+        """曲线约占 32%，下方表格约占 68%；明细区表格占满右侧。"""
+        total = max(400, self._mid_split.height())
+        chart_h = min(280, max(160, int(total * 0.32)))
+        self._mid_split.setSizes([chart_h, max(240, total - chart_h)])
+        detail_w = max(500, self._detail_split.width())
+        self._detail_split.setSizes([120, max(380, detail_w - 120)])
+
+    @staticmethod
+    def _make_kpi_card(title: str) -> tuple[QtWidgets.QFrame, QtWidgets.QLabel]:
+        """单个大指标卡：标题 + 大号数值。"""
+        card = QtWidgets.QFrame()
+        card.setObjectName("kpiCard")
+        card.setStyleSheet(_KPI_BOX_STYLE)
+        card.setMinimumHeight(92)
+        card.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
+        title_label = QtWidgets.QLabel(title)
+        title_label.setStyleSheet(_KPI_TITLE_STYLE)
+        value_label = QtWidgets.QLabel("--")
+        value_label.setStyleSheet(f"{_KPI_VALUE_STYLE} color: {_KPI_FLAT};")
+        value_label.setAlignment(
+            QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter
+        )
+        layout = QtWidgets.QVBoxLayout()
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(8)
+        layout.addWidget(title_label)
+        layout.addWidget(value_label)
+        layout.addStretch(1)
+        card.setLayout(layout)
+        return card, value_label
+
+    @staticmethod
+    def _make_curve_plot() -> pg.PlotWidget:
+        """暗底坐标轴图，供资金/回撤曲线复用。"""
+        plot = pg.PlotWidget(
+            background=_CHART_BG,
+            axisItems={"bottom": pg.DateAxisItem(orientation="bottom")},
+        )
+        # 去掉 PlotWidget 默认浅色边框/凸起框
+        plot.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        plot.setStyleSheet(
+            f"PlotWidget {{ background-color: {_CHART_BG}; border: none; }}"
+        )
+        plot.setMinimumHeight(120)
+        plot.showGrid(x=True, y=True, alpha=0.2)
+        plot.setMenuEnabled(False)
+        plot.hideButtons()
+        plot.addLegend(offset=(10, 8))
+        plot.getPlotItem().getViewBox().setBackgroundColor(_CHART_BG)
+        for name in ("left", "bottom"):
+            axis = plot.getAxis(name)
+            axis.setPen(pg.mkPen(_CHART_AXIS, width=1))
+            axis.setTextPen(pg.mkPen(_CHART_AXIS))
+        plot.setLabel("bottom", "日期")
+        return plot
+
+    @staticmethod
+    def _wrap_plot(title: str, plot: pg.PlotWidget) -> QtWidgets.QWidget:
+        panel = QtWidgets.QFrame()
+        panel.setObjectName("chartPanel")
+        panel.setStyleSheet(_CHART_BOX_STYLE)
+        title_label = QtWidgets.QLabel(title)
+        title_label.setStyleSheet("color: #c5cad3; font-size: 13px;")
+        layout = QtWidgets.QVBoxLayout()
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(4)
+        layout.addWidget(title_label)
+        layout.addWidget(plot, 1)
+        panel.setLayout(layout)
+        return panel
 
     def _update_buttons(self) -> None:
         """根据状态切换底部按钮。"""
@@ -256,7 +448,7 @@ class PortfolioBacktestDialog(QtWidgets.QDialog):
         self._pending_logs = []
         self._pending_daily = None
         self.progress_bar.setValue(0)
-        self.metrics_label.setText("指标：--")
+        self._clear_metrics_and_charts()
         self.detail_status.setText("")
         self.detail_table.setRowCount(0)
 
@@ -271,6 +463,14 @@ class PortfolioBacktestDialog(QtWidgets.QDialog):
             engine = BacktestingEngine()
             self._engine = engine
             engine.output = self._on_output
+            # 注入实盘 SqlApp，供策略 refresh_universe 读 stock_near_ma
+            try:
+                from vnpy_sqlapp import APP_NAME as _SQLAPP_NAME
+                from ..backtesting import _BacktestMainEngine
+                sql_engine = self.strategy_engine.main_engine.get_engine(_SQLAPP_NAME)
+                engine.main_engine = _BacktestMainEngine(sql_engine=sql_engine)
+            except Exception:  # noqa: BLE001 - 无 SqlApp 时选股池刷新会跳过
+                pass
 
             interval: Interval = self.INTERVAL_OPTIONS[self.interval_combo.currentIndex()][1]
             sd = self.start_date.date()
@@ -301,8 +501,8 @@ class PortfolioBacktestDialog(QtWidgets.QDialog):
 
             self._progress_phase = "load"
             engine.load_data()
-            if not engine.history_data:
-                self._fail_output("DuckDB 无可用行情数据，回测终止")
+            if not engine.trading_days:
+                self._fail_output("DuckDB 无可用交易日，回测终止")
                 return
 
             self._progress_phase = "replay"
@@ -367,26 +567,26 @@ class PortfolioBacktestDialog(QtWidgets.QDialog):
         self._update_progress_from_log(text)
 
     def _update_progress_from_log(self, msg: str) -> None:
-        """一次回测只走 0→100：加载按「已完成标的数/总数」映射到 0–60。
-
-        不再解析每个标的自己的 ``[0%]…[100%]``——那会把总进度条打成反复冲顶。
-        """
-        if self._progress_phase == "load":
-            if "历史数据加载完成" in msg and "所有" not in msg:
-                self._symbols_done = min(
-                    self._symbols_done + 1, self._symbols_total
-                )
-                overall = int(self._symbols_done / self._symbols_total * 60)
-                self.signal_progress.emit(max(1, min(60, overall)))
-                return
-            if "所有历史数据加载完成" in msg:
-                self.signal_progress.emit(60)
-                return
-        if "策略初始化完成" in msg:
-            self.signal_progress.emit(65)
-        elif "开始回放历史数据" in msg:
+        """一次回测只走 0→100：按自然日回放进度映射。"""
+        if "按自然日回放" in msg or "准备回测交易日" in msg:
+            self.signal_progress.emit(max(self._progress_value, 5))
+            return
+        # 「回放进度：12/38 日」
+        if "回放进度：" in msg and "/" in msg:
             self._progress_phase = "replay"
-            self.signal_progress.emit(70)
+            try:
+                part: str = msg.split("回放进度：", 1)[1]
+                frac: str = part.split("日", 1)[0].strip()
+                done_s, total_s = frac.split("/", 1)
+                done: int = int(done_s)
+                total: int = max(1, int(total_s))
+                overall: int = 10 + int(done / total * 78)
+                self.signal_progress.emit(min(88, max(10, overall)))
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        if "策略初始化完成" in msg:
+            self.signal_progress.emit(max(self._progress_value, 12))
         elif "历史数据回放结束" in msg:
             self.signal_progress.emit(88)
 
@@ -420,35 +620,126 @@ class PortfolioBacktestDialog(QtWidgets.QDialog):
 
     @QtCore.Slot()
     def _on_finished(self) -> None:
-        """主线程取回测结果并刷新明细。"""
+        """主线程取回测结果并刷新指标卡、曲线与明细。"""
         self._trades = dict(self._pending_trades or {})
         self._logs = list(self._pending_logs or [])
         self._daily_df = self._pending_daily
         self._render_metrics(dict(self._pending_stats or {}))
+        self._render_charts(self._daily_df)
         self._switch_detail(self.detail_list.currentRow())
         self._progress_value = 100
         self.progress_bar.setValue(100)
+        trade_count = int((self._pending_stats or {}).get("total_trade_count", 0) or 0)
+        if not trade_count:
+            self.detail_status.setText(
+                "无成交：可能未触发信号或标的/区间无匹配行情"
+            )
+
+    def _clear_metrics_and_charts(self) -> None:
+        """清空 5 指标卡与双曲线。"""
+        for label in self._kpi_values.values():
+            label.setText("--")
+            label.setStyleSheet(f"{_KPI_VALUE_STYLE} color: {_KPI_FLAT};")
+        self._equity_curve.setData([], [])
+        self._drawdown_curve.setData([], [])
 
     def _render_metrics(self, stats: dict) -> None:
-        keys = [
-            ("total_return", "总收益"),
-            ("annual_return", "年化"),
-            ("max_drawdown", "最大回撤"),
-            ("sharpe_ratio", "Sharpe"),
-            ("total_trade_count", "成交笔数"),
-        ]
-        parts: list[str] = []
-        for key, label in keys:
-            value = stats.get(key, "N/A")
-            if isinstance(value, float):
-                parts.append(f"{label}={value:.4g}")
+        """刷新 5 个大指标卡。"""
+        self._set_kpi_percent("total_return", stats.get("total_return"), signed=True)
+        self._set_kpi_percent("max_ddpercent", stats.get("max_ddpercent"), signed=True)
+        self._set_kpi_percent("annual_return", stats.get("annual_return"), signed=True)
+        self._set_kpi_number("sharpe_ratio", stats.get("sharpe_ratio"), digits=2)
+        self._set_kpi_count("total_trade_count", stats.get("total_trade_count"))
+
+    def _set_kpi_percent(
+        self, key: str, value: Any, *, signed: bool = False
+    ) -> None:
+        label = self._kpi_values[key]
+        if value is None or value == "" or (
+            isinstance(value, float) and (np.isnan(value) or np.isinf(value))
+        ):
+            label.setText("--")
+            label.setStyleSheet(f"{_KPI_VALUE_STYLE} color: {_KPI_FLAT};")
+            return
+        num = float(value)
+        text = f"{num:+.2f}%" if signed else f"{num:.2f}%"
+        color = _KPI_UP if num > 0 else (_KPI_DOWN if num < 0 else _KPI_FLAT)
+        # 最大回撤本身为负，固定红色更贴近 mock
+        if key == "max_ddpercent" and num < 0:
+            color = _KPI_DOWN
+        label.setText(text)
+        label.setStyleSheet(f"{_KPI_VALUE_STYLE} color: {color};")
+
+    def _set_kpi_number(self, key: str, value: Any, *, digits: int = 2) -> None:
+        label = self._kpi_values[key]
+        if value is None or value == "" or (
+            isinstance(value, float) and (np.isnan(value) or np.isinf(value))
+        ):
+            label.setText("--")
+            label.setStyleSheet(f"{_KPI_VALUE_STYLE} color: {_KPI_FLAT};")
+            return
+        label.setText(f"{float(value):.{digits}f}")
+        label.setStyleSheet(f"{_KPI_VALUE_STYLE} color: {_KPI_FLAT};")
+
+    def _set_kpi_count(self, key: str, value: Any) -> None:
+        label = self._kpi_values[key]
+        try:
+            count = int(value or 0)
+        except (TypeError, ValueError):
+            label.setText("--")
+            label.setStyleSheet(f"{_KPI_VALUE_STYLE} color: {_KPI_FLAT};")
+            return
+        label.setText(f"{count:,}")
+        label.setStyleSheet(f"{_KPI_VALUE_STYLE} color: {_KPI_FLAT};")
+
+    def _render_charts(self, df: Any) -> None:
+        """刷新资金曲线（净值）与回撤曲线（ddpercent）。"""
+        if df is None or getattr(df, "empty", True):
+            self._equity_curve.setData([], [])
+            self._drawdown_curve.setData([], [])
+            return
+
+        xs: list[float] = []
+        for idx in df.index:
+            if isinstance(idx, datetime):
+                xs.append(idx.timestamp())
+            elif isinstance(idx, date):
+                xs.append(datetime(idx.year, idx.month, idx.day).timestamp())
             else:
-                parts.append(f"{label}={value}")
-        trade_count = stats.get("total_trade_count", 0) or 0
-        suffix = ""
-        if not trade_count:
-            suffix = "  （无成交：可能未触发信号或标的/区间无匹配行情）"
-        self.metrics_label.setText("指标：" + "  ".join(parts) + suffix)
+                try:
+                    xs.append(datetime.fromisoformat(str(idx)[:10]).timestamp())
+                except ValueError:
+                    xs.append(float(len(xs)))
+
+        capital = 1.0
+        if self._engine is not None and getattr(self._engine, "capital", 0):
+            capital = float(self._engine.capital) or 1.0
+
+        if "balance" in df.columns:
+            equity = (df["balance"].astype(float) / capital).tolist()
+        else:
+            equity = []
+
+        if "ddpercent" in df.columns:
+            drawdown = df["ddpercent"].astype(float).tolist()
+        elif "drawdown" in df.columns and capital:
+            drawdown = (df["drawdown"].astype(float) / capital * 100.0).tolist()
+        else:
+            drawdown = []
+
+        if equity and len(equity) == len(xs):
+            # 填充到序列最低点，避免净值从 0 起填整幅
+            self._equity_curve.setFillLevel(min(equity))
+            self._equity_curve.setData(xs, equity)
+            self.equity_plot.setLabel("left", "净值")
+        else:
+            self._equity_curve.setData([], [])
+
+        if drawdown and len(drawdown) == len(xs):
+            self._drawdown_curve.setData(xs, drawdown)
+            self.drawdown_plot.setLabel("left", "回撤 %")
+        else:
+            self._drawdown_curve.setData([], [])
 
     @QtCore.Slot(int)
     def _switch_detail(self, row: int) -> None:
@@ -505,21 +796,7 @@ class PortfolioBacktestDialog(QtWidgets.QDialog):
                         f"{float(ret):.6f}" if ret is not None else ""
                     ),
                 )
-        elif row == 2:  # 情绪数据
-            self.detail_table.setColumnCount(1)
-            self.detail_table.setHorizontalHeaderLabels(["说明"])
-            self.detail_table.setRowCount(1)
-            has_sentiment = (
-                self._engine is not None
-                and getattr(self._engine, "sentiment_context", None) is not None
-            )
-            text = (
-                "已注入历史情绪上下文（按 Bar 时间回放）"
-                if has_sentiment
-                else "未注入情绪历史：信号按无情绪保守降级"
-            )
-            self.detail_table.setItem(0, 0, QtWidgets.QTableWidgetItem(text))
-        elif row == 3:  # 回测日志
+        elif row == 2:  # 回测日志
             self.detail_table.setColumnCount(1)
             self.detail_table.setHorizontalHeaderLabels(["日志"])
             logs = getattr(self, "_logs", []) or []

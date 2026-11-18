@@ -292,15 +292,32 @@ class StrategyManager(QtWidgets.QFrame):
         else:
             vt_symbols = []
             setting = dict(self._data.get("parameters", {}))
+        # parent 用主窗口，并同步应用/主窗样式，避免无主题时列表表格露出白底
+        host: QtWidgets.QWidget | None = self.window()
         dialog: PortfolioBacktestDialog = PortfolioBacktestDialog(
             self.strategy_engine,
             strategy_name=strategy_name,
             strategy_class_name=class_name,
             vt_symbols=vt_symbols,
             strategy_setting=setting,
-            parent=self,
+            parent=host,
         )
-        dialog.exec_()
+        app = QtWidgets.QApplication.instance()
+        theme_style: str = ""
+        if host is not None:
+            dialog.setPalette(host.palette())
+            theme_style = host.styleSheet() or theme_style
+        if app is not None:
+            if not theme_style:
+                theme_style = app.styleSheet() or ""
+            dialog.setPalette(app.palette())
+        if theme_style:
+            dialog.setStyleSheet(theme_style)
+        # 先设最大化状态再 exec，避免 showMaximized + exec 叠用异常
+        dialog.setWindowState(
+            dialog.windowState() | QtCore.Qt.WindowState.WindowMaximized
+        )
+        dialog.exec()
 
     def remove_strategy(self) -> None:
         """移除策略"""
